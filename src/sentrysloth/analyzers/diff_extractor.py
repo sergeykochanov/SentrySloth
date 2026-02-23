@@ -23,7 +23,7 @@ SKIP_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"(^|/)spec[s]?/"),
     re.compile(r"(^|/)__pycache__/"),
     re.compile(r"\.(lock|sum)$"),
-    re.compile(r"(^|/)\.github/"),
+    # .github/ is NOT skipped -- CI workflows are security-relevant
     re.compile(r"(^|/)\.gitignore$"),
     re.compile(r"(^|/)(?:changelog|changelog\.[^/]+)$", re.IGNORECASE),
     re.compile(r"(^|/)(?:license|license\.[^/]+)$", re.IGNORECASE),
@@ -41,25 +41,98 @@ SKIP_PATTERNS: list[re.Pattern[str]] = [
     re.compile(r"\.pb\.go$"),
 ]
 
-# Security-relevant patterns with weights
-SECURITY_PATTERNS: list[tuple[re.Pattern[str], float]] = [
-    (re.compile(r"\b(auth|authn|authz|login|logout|session|token|jwt|oauth)\b", re.I), 0.8),
-    (re.compile(r"\b(password|passwd|secret|credential|api[_-]?key)\b", re.I), 0.9),
-    (re.compile(r"\b(crypto|encrypt|decrypt|hash|hmac|sign|verify|cert)\b", re.I), 0.8),
-    (re.compile(r"\b(sql|query|execute|cursor|prepared)\b", re.I), 0.6),
-    (re.compile(r"\b(exec|eval|system|popen|subprocess|spawn|shell)\b", re.I), 0.9),
-    (re.compile(r"\b(deserializ|unpickle|yaml\.load|json\.loads|marshal)\b", re.I), 0.7),
-    (re.compile(r"\b(parse|sanitiz|escap|encod|decode|strip|filter)\b", re.I), 0.5),
-    (re.compile(r"\b(input|request|header|cookie|param|query_string|form)\b", re.I), 0.5),
-    (re.compile(r"\b(path|file|open|read|write|mkdir|rmdir|unlink|chmod)\b", re.I), 0.6),
-    (re.compile(r"\b(template|render|inject|format|interpolat)\b", re.I), 0.5),
-    (re.compile(r"\b(redirect|url|href|src|origin|cors|csp|referrer)\b", re.I), 0.5),
-    (re.compile(r"\b(permission|role|admin|root|sudo|privilege|acl)\b", re.I), 0.7),
-    (re.compile(r"\b(ssl|tls|https|certificate|verify)\b", re.I), 0.7),
-    (re.compile(r"\b(timeout|rate[_-]?limit|throttl|backoff)\b", re.I), 0.4),
-    (re.compile(r"\b(socket|bind|listen|connect|proxy)\b", re.I), 0.5),
+# Path-based score boost: files whose path signals security relevance get an
+# extra weight injected into the accumulative scoring formula.
+PATH_BOOST_PATTERNS: list[tuple[re.Pattern[str], float]] = [
+    (re.compile(r"(^|/)\.github/workflows/"), 0.4),
+    (re.compile(r"(^|/)\.gitlab-ci"), 0.4),
+    (re.compile(r"(^|/)Dockerfile", re.I), 0.3),
+    (re.compile(r"(^|/)docker-compose", re.I), 0.3),
+    (re.compile(r"(^|/)(?:k8s|helm|kustomize)/"), 0.3),
+    (re.compile(r"(^|/)(?:nginx|traefik|haproxy|caddy)", re.I), 0.3),
+    (re.compile(r"(^|/)(?:requirements.*\.txt|setup\.py|setup\.cfg|pyproject\.toml)$", re.I), 0.3),
+    (re.compile(r"(^|/)(?:pom\.xml|build\.gradle|Gemfile|Cargo\.toml)$"), 0.3),
+    (re.compile(r"(^|/)package\.json$"), 0.2),
+]
+
+# ---------------------------------------------------------------------------
+# Security-relevant patterns with weights.
+#
+# Weights feed an accumulative formula: score = 1 - prod(1 - w_i).
+# Keep weights calibrated so that:
+#   - A single "noisy" keyword (parse/url/format) alone stays below 0.3.
+#   - Two moderate signals compound above 0.5.
+#   - Any critical pattern alone pushes above 0.85.
+# ---------------------------------------------------------------------------
+
+# Critical patterns (weight >= 0.9) -- a single match is high-signal
+CRITICAL_PATTERNS: list[tuple[re.Pattern[str], float]] = [
     (re.compile(r"(verify\s*=\s*False|insecure|no[_-]?verify|skip[_-]?verif)", re.I), 0.95),
-    (re.compile(r"(TODO|FIXME|HACK|XXX|SECURITY|VULNERABLE)", re.I), 0.6),
+    (re.compile(r"InsecureSkipVerify", re.I), 0.95),
+    (re.compile(r"-----BEGIN[A-Z ]*PRIVATE KEY", re.I), 0.95),
+    (re.compile(r"AKIA[0-9A-Z]{16}"), 0.95),
+    (re.compile(r"gh[pousr]_[A-Za-z0-9_]{20,}"), 0.95),
+    (re.compile(r"github_pat_[A-Za-z0-9_]{20,}"), 0.95),
+    (re.compile(r"xox[baprs]-[A-Za-z0-9\-]{10,}"), 0.95),
+    (re.compile(r"sk_live_[A-Za-z0-9]{10,}"), 0.95),
+    (re.compile(r"rk_live_[A-Za-z0-9]{10,}"), 0.95),
+    (
+        re.compile(
+            r"(?:skip|disable|bypass|ignore|trust|remove).{0,40}"
+            r"(?:auth|verif|csrf|tls|cert|sanitiz|permission|valid)",
+            re.I,
+        ),
+        0.9,
+    ),
+    (re.compile(r"169\.254\.169\.254|metadata\.google\.internal"), 0.9),
+    (re.compile(r"\b(file|gopher|dict)://", re.I), 0.9),
+    (re.compile(r"\b(exec|eval|system|popen|subprocess|spawn|shell)\b", re.I), 0.9),
+    (re.compile(r"\b(password|passwd|secret|credential|api[_-]?key)\b", re.I), 0.9),
+]
+
+# Standard patterns (weight 0.3 - 0.85)
+SECURITY_PATTERNS: list[tuple[re.Pattern[str], float]] = [
+    *CRITICAL_PATTERNS,
+    # Auth / identity
+    (re.compile(r"\b(auth|authn|authz|login|logout|session|token|jwt|oauth)\b", re.I), 0.7),
+    # Crypto
+    (re.compile(r"\b(crypto|encrypt|decrypt|hmac|sign|cert)\b", re.I), 0.7),
+    # SQL / DB
+    (re.compile(r"\b(sql|query|execute|cursor|prepared)\b", re.I), 0.6),
+    # Deserialization
+    (re.compile(r"\b(deserializ|unpickle|yaml\.load|marshal|ObjectInputStream)\b", re.I), 0.7),
+    # Permissions / privilege
+    (re.compile(r"\b(permission|role|admin|root|sudo|privilege|acl)\b", re.I), 0.7),
+    # TLS / certificates
+    (re.compile(r"\b(ssl|tls|https|certificate)\b", re.I), 0.6),
+    # File system
+    (re.compile(r"\b(path|file|open|read|write|mkdir|rmdir|unlink|chmod)\b", re.I), 0.5),
+    # DOM XSS sinks
+    (re.compile(r"\b(innerHTML|outerHTML|dangerouslySetInnerHTML|document\.write|v-html)\b"), 0.85),
+    # Web vuln keywords
+    (re.compile(r"\b(csrf|xsrf|ssrf|xxe|idor|xss)\b", re.I), 0.7),
+    # Debug / open-access flags
+    (re.compile(r"(debug\s*=\s*True|DEBUG\s*=\s*true|allowAll|permitAll)", re.I), 0.8),
+    # Network
+    (re.compile(r"\b(socket|bind|listen|connect|proxy)\b", re.I), 0.4),
+    # Input sources
+    (re.compile(r"\b(input|request|header|cookie|param|query_string|form)\b", re.I), 0.3),
+    # Inject (standalone -- high-value keyword)
+    (re.compile(r"\b(inject)\b", re.I), 0.5),
+    # Templating / rendering (lower -- noisy without other signals)
+    (re.compile(r"\b(template|render|format|interpolat)\b", re.I), 0.2),
+    # Redirect / URL (lower -- noisy alone)
+    (re.compile(r"\b(redirect|origin|cors|csp|referrer)\b", re.I), 0.3),
+    (re.compile(r"\b(url|href|src)\b", re.I), 0.2),
+    # Sanitisation / encoding helpers (very low alone, but compound well)
+    (re.compile(r"\b(parse|sanitiz|escap|encod|decode|strip|filter)\b", re.I), 0.2),
+    # Weak crypto (low alone; compounds with password/hmac/sign)
+    (re.compile(r"\b(md5|sha1|rc4|des|3des)\b", re.I), 0.3),
+    (re.compile(r"\bECB\b"), 0.4),
+    # Rate limiting / DoS
+    (re.compile(r"\b(timeout|rate[_-]?limit|throttl|backoff)\b", re.I), 0.3),
+    # Markers
+    (re.compile(r"(TODO|FIXME|HACK|XXX|SECURITY|VULNERABLE)", re.I), 0.4),
 ]
 
 LANGUAGE_MAP: dict[str, str] = {
@@ -71,6 +144,7 @@ LANGUAGE_MAP: dict[str, str] = {
     ".java": "java",
     ".rb": "ruby",
     ".c": "c",
+    ".cc": "cpp",
     ".cpp": "cpp",
     ".h": "c",
     ".hpp": "cpp",
@@ -93,15 +167,104 @@ def detect_language(file_path: str) -> str:
     return LANGUAGE_MAP.get(PurePosixPath(file_path).suffix, "")
 
 
-def compute_security_score(content: str) -> float:
-    """Compute a heuristic security relevance score for diff content."""
-    if not content:
+def _extract_changed_lines(raw_diff: str) -> str:
+    """Extract only added/removed lines and hunk headers from a unified diff.
+
+    Ignores context lines (leading space) and ---/+++ file headers so that
+    security scoring focuses on what actually changed.
+    """
+    lines: list[str] = []
+    for line in raw_diff.splitlines():
+        if line.startswith("@@") or (
+            line.startswith(("+", "-")) and not line.startswith(("+++", "---"))
+        ):
+            lines.append(line)
+    return "\n".join(lines)
+
+
+_COMMENT_PREFIX_RE = re.compile(r"^\s*(?://|#|/\*|\*/?\s*|\*)\s*")
+
+
+def _is_noise_only_change(raw_diff: str) -> bool:
+    """Detect whitespace-only or comment-only changes.
+
+    Compares added vs removed lines after normalising whitespace (and
+    optionally stripping comment prefixes).  When the normalised sets are
+    equal the diff is cosmetic.
+    """
+    added: list[str] = []
+    removed: list[str] = []
+    for line in raw_diff.splitlines():
+        if line.startswith(("+++", "---")):
+            continue
+        if line.startswith("+"):
+            added.append(line[1:])
+        elif line.startswith("-"):
+            removed.append(line[1:])
+
+    if not added and not removed:
+        return True
+
+    def _normalize_ws(lines: list[str]) -> list[str]:
+        return sorted("".join(s.split()) for s in lines)
+
+    if _normalize_ws(added) == _normalize_ws(removed):
+        return True
+
+    def _strip_comments(lines: list[str]) -> list[str]:
+        return sorted("".join(_COMMENT_PREFIX_RE.sub("", s).split()) for s in lines)
+
+    if _strip_comments(added) == _strip_comments(removed):
+        return True
+
+    def _is_comment_line(line: str) -> bool:
+        stripped = line.lstrip()
+        return stripped.startswith(("#", "//", "/*", "*/", "*"))
+
+    return all(_is_comment_line(s) for s in added) and all(_is_comment_line(s) for s in removed)
+
+
+def _path_boost_weight(file_path: str) -> float:
+    """Return the highest path-based boost weight for a file, or 0."""
+    best = 0.0
+    for pat, w in PATH_BOOST_PATTERNS:
+        if pat.search(file_path):
+            best = max(best, w)
+    return best
+
+
+def compute_security_score(
+    content: str,
+    *,
+    changed_lines_only: str = "",
+    file_path: str = "",
+) -> float:
+    """Compute a heuristic security relevance score for diff content.
+
+    Uses an accumulative formula: ``1 - prod(1 - w_i)`` over all triggered
+    pattern weights so that multiple moderate signals compound into a higher
+    score (e.g. input 0.3 + sql 0.6 -> 0.72).
+
+    When *changed_lines_only* is provided the patterns are matched against
+    that text (only ``+``/``-`` lines), reducing noise from diff context.
+
+    When *file_path* is provided, path-based boost weights from
+    ``PATH_BOOST_PATTERNS`` are injected into the formula.
+    """
+    text = changed_lines_only or content
+    if not text:
         return 0.0
-    max_score = 0.0
-    for pattern, weight in SECURITY_PATTERNS:
-        if pattern.search(content):
-            max_score = max(max_score, weight)
-    return max_score
+    triggered = [w for pat, w in SECURITY_PATTERNS if pat.search(text)]
+    if file_path:
+        path_w = _path_boost_weight(file_path)
+        if path_w > 0:
+            triggered.append(path_w)
+    if not triggered:
+        return 0.0
+    score = 1.0
+    for w in triggered:
+        score *= 1.0 - w
+    return round(1.0 - score, 4)
 
 
 def estimate_tokens(text: str) -> int:
@@ -138,7 +301,7 @@ def extract_chunks(
 
     try:
         patch_set = PatchSet(diff_text)
-    except (ValueError, UnidiffParseError) as exc:
+    except (ValueError, UnidiffParseError, UnboundLocalError) as exc:
         logger.warning("Failed to parse diff (%s), falling back to raw chunking", exc)
         return _fallback_chunk(diff_text, settings)
 
@@ -241,12 +404,19 @@ def _make_chunk(
     truncated: bool = False,
 ) -> DiffChunk:
     sanitized = sanitize_diff_content(raw_diff)
+    changed = _extract_changed_lines(sanitized)
+    if _is_noise_only_change(sanitized):
+        sec_score = 0.0
+    else:
+        sec_score = compute_security_score(
+            sanitized, changed_lines_only=changed, file_path=file_path
+        )
     return DiffChunk(
         file_path=file_path,
         hunks=hunks,
         raw_diff=sanitized,
         token_estimate=estimate_tokens(sanitized),
-        security_score=compute_security_score(sanitized),
+        security_score=sec_score,
         language=language,
         truncated=truncated,
     )
@@ -268,12 +438,15 @@ def _fallback_chunk(diff_text: str, settings: Settings) -> list[DiffChunk]:
     """Fallback: treat entire diff as a single chunk."""
     truncated = _truncate_to_budget(diff_text, settings.chunk_token_budget)
     sanitized = sanitize_diff_content(truncated)
+    changed = _extract_changed_lines(sanitized)
     return [
         DiffChunk(
             file_path="<unknown>",
             hunks=[],
             raw_diff=sanitized,
             token_estimate=estimate_tokens(sanitized),
-            security_score=compute_security_score(sanitized),
+            security_score=compute_security_score(
+                sanitized, changed_lines_only=changed, file_path="<unknown>"
+            ),
         )
     ]

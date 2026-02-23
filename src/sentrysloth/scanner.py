@@ -143,6 +143,27 @@ async def _extract_and_enrich(
         on_info("[yellow]No analyzable code changes found.[/yellow]")
         return EXIT_OK, release, []
 
+    threshold = settings.prefilter_min_security_score
+    if threshold > 0:
+        before = len(chunks)
+        chunks = [c for c in chunks if c.security_score >= threshold]
+        dropped = before - len(chunks)
+        if dropped:
+            logger.info(
+                "Prefilter: %d -> %d chunks (threshold=%.2f, dropped=%d)",
+                before,
+                len(chunks),
+                threshold,
+                dropped,
+            )
+
+    if not chunks:
+        on_info(
+            f"[yellow]No chunks above security threshold "
+            f"({threshold:.2f}) — all filtered out.[/yellow]"
+        )
+        return EXIT_OK, release, []
+
     on_phase(f"{len(chunks)} chunks")
     on_info(f"  Extracted {len(chunks)} diff chunks")
 
