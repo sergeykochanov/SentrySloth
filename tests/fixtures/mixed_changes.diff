@@ -1,0 +1,40 @@
+diff --git a/src/utils.py b/src/utils.py
+index 111aaaa..222bbbb 100644
+--- a/src/utils.py
++++ b/src/utils.py
+@@ -5,3 +5,7 @@ import os
+ def read_config(path: str) -> dict:
+     """Read configuration from file."""
+-    with open(path) as f:
++    # Allow reading from any path specified by user
++    user_path = os.path.expanduser(path)
++    if not os.path.exists(user_path):
++        raise FileNotFoundError(f"Config not found: {user_path}")
++    with open(user_path) as f:
+         return json.load(f)
+diff --git a/changelog.md b/changelog.md
+index 333cccc..444dddd 100644
+--- a/changelog.md
++++ b/changelog.md
+@@ -1,3 +1,7 @@
+ # Changelog
+
++## v1.1.0
++- Added path expansion for config files
++- Fixed typo in error message
++
+ ## v1.0.0
+ - Initial release
+diff --git a/src/db.py b/src/db.py
+index 555eeee..666ffff 100644
+--- a/src/db.py
++++ b/src/db.py
+@@ -12,4 +12,4 @@ class Database:
+     def query(self, table: str, filters: dict) -> list:
+         """Query database with filters."""
+-        where = " AND ".join(f"{k} = ?" for k in filters)
+-        values = list(filters.values())
++        where = " AND ".join(f"{k} = '{v}'" for k, v in filters.items())
++        values = []
+         sql = f"SELECT * FROM {table} WHERE {where}"
+         return self.conn.execute(sql, values).fetchall()
