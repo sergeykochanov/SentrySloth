@@ -6,7 +6,7 @@ import hashlib
 from datetime import UTC, datetime
 from enum import StrEnum
 from functools import cached_property
-from typing import Generic, TypeVar
+from typing import Generic, Literal, TypeVar
 
 from pydantic import BaseModel, Field, computed_field
 
@@ -32,6 +32,19 @@ class Confidence(StrEnum):
     HIGH = "high"
     MEDIUM = "medium"
     LOW = "low"
+
+
+class ReviewStatus(StrEnum):
+    NEEDS_REVIEW = "needs_review"
+    CONFIRMED_STATIC = "confirmed_static"
+    REPRODUCED = "reproduced"
+    REJECTED = "rejected"
+
+
+class ScanMode(StrEnum):
+    REGRESSION = "regression"
+    PATCH = "patch"
+    BOTH = "both"
 
 
 CONFIDENCE_ORDER: dict[Confidence, int] = {
@@ -65,6 +78,8 @@ class AffectedCode(BaseModel):
     end_line: int
     snippet: str = Field(description="Relevant code snippet from the diff")
     is_added: bool = Field(description="True if this is newly added code")
+    revision: Literal["before", "after"] = "after"
+    commit_sha: str = ""
 
 
 class Evidence(BaseModel):
@@ -88,15 +103,38 @@ class Finding(BaseModel):
     cwe: list[CWEEntry] = Field(default_factory=list)
     recommendation: str = ""
     prompt_version: str = ""
+    status: ReviewStatus = ReviewStatus.NEEDS_REVIEW
+    review_reason: str = ""
+    verification_reads: list[str] = Field(default_factory=list)
+    root_cause: str = ""
+    attacker_control: str = ""
+    entry_point: str = ""
+    trust_boundary: str = ""
+    impact: str = ""
+    before_after: str = ""
+    mitigations_checked: list[str] = Field(default_factory=list)
+    missing_evidence: list[str] = Field(default_factory=list)
 
     @computed_field
     @property
     def finding_id(self) -> str:
-        """Stable finding identifier based on repo, file, hunk, and type.
+        """Identifier based on root cause and source evidence, independent of chunk boundaries.
 
         Uses first 16 hex chars of SHA-256 (64 bits). Collision probability is
         negligible for the expected number of findings per scan (~1e-10 at 10k findings).
         """
+        anchors = sorted(
+            (ev.code.file_path, ev.code.revision, ev.code.snippet.strip("\n"))
+            for ev in self.evidence
+        )
+        raw = (
+            f"{self.repo}:{self.file_path}:{self.finding_type.value}:"
+            f"{self.root_cause or self.title}:{anchors}"
+        )
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    @property
+    def legacy_finding_id(self) -> str:
         raw = f"{self.repo}:{self.file_path}:{self.hunk_signature}:{self.finding_type.value}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
@@ -126,6 +164,8 @@ class DiffChunk(BaseModel):
     context: str = Field(default="", description="Surrounding code context")
     function_signatures: list[str] = Field(default_factory=list)
     truncated: bool = False
+    review_context: str = ""
+    scan_mode: ScanMode = ScanMode.REGRESSION
 
 
 class TriageResult(BaseModel):
@@ -146,6 +186,11 @@ class ReleaseInfo(BaseModel):
     total_files_changed: int = 0
     total_additions: int = 0
     total_deletions: int = 0
+    from_sha: str = ""
+    to_sha: str = ""
+    relationship: str = "unknown"
+    excluded_paths: list[str] = Field(default_factory=list)
+    prefilter_dropped: int = 0
 
 
 class RepoPathRole(BaseModel):
@@ -197,6 +242,10 @@ class ScanResult(BaseModel):
     completed_at: datetime | None = None
     prompt_version: str = ""
     llm_metrics: LLMMetrics | None = None
+    candidates: list[Finding] = Field(default_factory=list)
+    complete: bool = True
+    mode: ScanMode = ScanMode.REGRESSION
+    coverage_issues: list[str] = Field(default_factory=list)
 
 
 class TriageStats(BaseModel):
@@ -204,6 +253,7 @@ class TriageStats(BaseModel):
     security_relevant: int = 0
     filtered_out: int = 0
     skipped_files: int = 0
+    prefilter_dropped: int = 0
 
 
 class LLMMetrics(BaseModel):
@@ -214,11 +264,22 @@ class LLMMetrics(BaseModel):
     total_cost_estimate: float = 0.0
     triage_latency_ms: float = 0.0
     analysis_latency_ms: float = 0.0
+    analysis_completed: int = 0
+    verification_input_tokens: int = 0
+    verification_output_tokens: int = 0
+    verification_latency_ms: float = 0.0
+    errors: list[str] = Field(default_factory=list)
+    token_usage_complete: bool = True
 
     def merge(self, other: LLMMetrics) -> LLMMetrics:
-        """Sum all numeric fields from two metrics objects."""
+        """Sum counters and concatenate explicit coverage errors."""
         return LLMMetrics(
-            **{field: getattr(self, field) + getattr(other, field) for field in self.model_fields}
+            **{
+                field: getattr(self, field) + getattr(other, field)
+                for field in type(self).model_fields
+                if field != "token_usage_complete"
+            },
+            token_usage_complete=self.token_usage_complete and other.token_usage_complete,
         )
 
 

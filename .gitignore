@@ -17,3 +17,8 @@ batch-reports/
 advisories/
 configs/
 .vscode/
+
+# Local test coverage
+.coverage
+coverage.xml
+htmlcov/

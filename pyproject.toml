@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sentrysloth"
-version = "0.1.0"
+version = "0.2.0"
 description = "Change-risk / security-review assistant for open-source releases"
 requires-python = ">=3.11"
 authors = [{name = "sergeykochanov"}]
@@ -77,3 +77,10 @@ select = ["E", "F", "I", "N", "W", "UP", "B", "SIM", "S", "RUF"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["sentrysloth"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src", "/tests", "/scripts", "/evaluation", "/.github",
+    "/pyproject.toml", "/README.md", "/CHANGELOG.md", "/LICENSE",
+    "/CONTRIBUTING.md", "/Dockerfile", "/.env.example",
+]

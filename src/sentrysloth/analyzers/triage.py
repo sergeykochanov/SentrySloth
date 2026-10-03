@@ -18,7 +18,7 @@ from sentrysloth.providers.base import LLMProvider, LLMProviderError, LLMQuotaEx
 
 logger = logging.getLogger(__name__)
 
-TRIAGE_PROMPT_VERSION = "v2"
+TRIAGE_PROMPT_VERSION = "v3"
 
 TRIAGE_SYSTEM_PROMPT = """\
 You are a security triage analyst. Your task is to quickly determine if a code \
@@ -121,6 +121,12 @@ def build_triage_prompt(chunk: DiffChunk) -> str:
         f"\n## File: {chunk.file_path}",
         f"## Language: {chunk.language or 'unknown'}",
     ]
+    if chunk.scan_mode.value in {"patch", "both"}:
+        parts.append(
+            "This scan also reviews incomplete security fixes. Changes to guards, validation, "
+            "security tests and dependencies are relevant even when they improve security. "
+            "Do not discard indentation, statement order, or commented-out controls as formatting."
+        )
     if chunk.function_signatures:
         parts.append("## Functions in scope:")
         for sig in chunk.function_signatures:

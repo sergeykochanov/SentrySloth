@@ -44,6 +44,8 @@ def generate_sarif_report(result: ScanResult) -> str:
 
         locations: list[dict] = []
         for ev in finding.evidence:
+            if ev.code.revision != "after":
+                continue
             locations.append(
                 {
                     "physicalLocation": {
@@ -99,9 +101,13 @@ def generate_sarif_report(result: ScanResult) -> str:
                 "results": results,
                 "invocations": [
                     {
-                        "executionSuccessful": True,
+                        "executionSuccessful": result.complete,
                         "properties": {
                             "scanId": result.scan_id,
+                            "coverageIssues": result.coverage_issues,
+                            "candidateCount": len(result.candidates),
+                            "fromSha": result.release.from_sha,
+                            "toSha": result.release.to_sha,
                             "fromRef": result.release.from_ref,
                             "toRef": result.release.to_ref,
                         },

@@ -123,14 +123,14 @@ def repo_name_from_url(url: str) -> str:
 
 
 def resolve_tag_fetch_limit(
-    pairing_mode: Literal["chronological", "per_major"],
+    pairing_mode: Literal["chronological", "per_major", "ancestry"],
     last_releases: int | None,
 ) -> int:
     """Select tag fetch limit based on pairing strategy and filters."""
     if last_releases:
         # latest-major-first selection may need tags from multiple major streams.
         return PER_MAJOR_TAG_FETCH_LIMIT
-    if pairing_mode == "per_major":
+    if pairing_mode in {"per_major", "ancestry"}:
         return PER_MAJOR_TAG_FETCH_LIMIT
     return DEFAULT_CHRONOLOGICAL_TAG_FETCH_LIMIT
 
@@ -151,7 +151,7 @@ def build_tag_pairs(
     last_releases: int | None = None,
     since: datetime | None = None,
     tag_dates: list[datetime] | None = None,
-    pairing_mode: Literal["chronological", "per_major"] = "chronological",
+    pairing_mode: Literal["chronological", "per_major", "ancestry"] = "chronological",
 ) -> list[TagPair]:
     """Build consecutive tag pairs from tag list.
 
@@ -209,17 +209,7 @@ def build_tag_pairs(
         return pairs
 
     if pairing_mode == "per_major":
-        if since is not None:
-            if tag_dates is None:
-                raise BatchError("tag_dates required when using --since")
-            if len(tag_dates) != len(tags_newest_first):
-                raise BatchError("tag_dates length must match tags_newest_first length")
-            tags_for_pairing = [
-                tag for tag, dt in zip(tags_newest_first, tag_dates, strict=True) if dt >= since
-            ]
-        else:
-            tags_for_pairing = tags_newest_first
-
+        tags_for_pairing = tags_newest_first
         groups: dict[int, list[tuple[tuple[int, ...], str]]] = defaultdict(list)
         for tag in tags_for_pairing:
             parsed = parse_version(tag)
@@ -234,31 +224,80 @@ def build_tag_pairs(
             if len(ordered) < 2:
                 continue
             pairs.extend(TagPair(ordered[i], ordered[i + 1]) for i in range(len(ordered) - 1))
-        return pairs
+        return _filter_pair_dates(pairs, tags_newest_first, tag_dates, since)
 
     if pairing_mode != "chronological":
         raise BatchError(f"Unknown pairing_mode: {pairing_mode}")
 
-    if since is not None:
-        if tag_dates is None:
-            raise BatchError("tag_dates required when using --since")
-        if len(tag_dates) != len(tags_newest_first):
-            raise BatchError("tag_dates length must match tags_newest_first length")
-
-        # Filter tags whose date >= since, keep newest-first order
-        filtered = [
-            (tag, dt) for tag, dt in zip(tags_newest_first, tag_dates, strict=True) if dt >= since
-        ]
-        if len(filtered) < 2:
-            return []
-
-        # Reverse to chronological order
-        filtered.reverse()
-        return [TagPair(filtered[i][0], filtered[i + 1][0]) for i in range(len(filtered) - 1)]
-
-    # No filter: build pairs from all tags
     all_tags = list(reversed(tags_newest_first))
-    return [TagPair(all_tags[i], all_tags[i + 1]) for i in range(len(all_tags) - 1)]
+    pairs = [TagPair(all_tags[i], all_tags[i + 1]) for i in range(len(all_tags) - 1)]
+    return _filter_pair_dates(pairs, tags_newest_first, tag_dates, since)
+
+
+def _filter_pair_dates(
+    pairs: list[TagPair],
+    tags: list[str],
+    dates: list[datetime] | None,
+    since: datetime | None,
+) -> list[TagPair]:
+    if since is None:
+        return pairs
+    if dates is None or len(dates) != len(tags):
+        raise BatchError("tag_dates required and length must match tags_newest_first")
+    by_tag = dict(zip(tags, dates, strict=True))
+    return [pair for pair in pairs if by_tag[pair.to_ref] >= since]
+
+
+async def resolve_tag_pairs(
+    git_source: GitSource,
+    tags: list[str],
+    *,
+    last_releases: int | None = None,
+    since: datetime | None = None,
+    tag_dates: list[datetime] | None = None,
+    pairing_mode: str = "ancestry",
+) -> list[TagPair]:
+    """Pair each release with the closest older version on its actual history.
+
+    Same major/minor ancestors take precedence, then the highest older version.
+    A tag's timestamp is not evidence that another tag is its predecessor.
+    """
+    if pairing_mode != "ancestry":
+        return build_tag_pairs(
+            tags,
+            last_releases=last_releases,
+            since=since,
+            tag_dates=tag_dates,
+            pairing_mode=pairing_mode,
+        )
+    if last_releases is not None and last_releases < 1:
+        return []
+    versions = {tag: parse_version(tag) for tag in tags}
+    shas = {tag: await git_source.resolve_ref(tag) for tag in tags}
+    pairs = []
+    # Newest versions first; only stop after finding the requested transitions.
+    ordered = sorted(tags, key=lambda tag: versions[tag][1] if versions[tag] else (), reverse=True)
+    for target in ordered:
+        parsed = versions[target]
+        if parsed is None:
+            continue
+        candidates = [
+            tag
+            for tag in ordered
+            if versions[tag] and versions[tag][1] < parsed[1] and shas[tag] != shas[target]
+        ]
+        candidates.sort(
+            key=lambda tag: (versions[tag][1][:2] == parsed[1][:2], versions[tag][1]), reverse=True
+        )
+        for source in candidates:
+            if await git_source.is_ancestor(shas[source], shas[target]):
+                pair = TagPair(source, target)
+                if _filter_pair_dates([pair], tags, tag_dates, since):
+                    pairs.append(pair)
+                break
+        if last_releases is not None and len(pairs) >= last_releases:
+            break
+    return list(reversed(pairs))
 
 
 def _sanitize_ref_for_filename(ref: str) -> str:
@@ -275,7 +314,7 @@ async def run_batch_scan(
     *,
     last_releases: int | None = None,
     since: datetime | None = None,
-    pairing_mode: Literal["chronological", "per_major"] = "chronological",
+    pairing_mode: Literal["chronological", "per_major", "ancestry"] = "ancestry",
     concurrency: int = 1,
 ) -> BatchResult:
     """Run scans for all repos with repo-level parallelism.
@@ -330,7 +369,8 @@ async def run_batch_scan(
         # Make since timezone-aware if tag dates are timezone-aware
         effective_since = normalize_since_for_tag_dates(since, tag_dates)
 
-        pairs = build_tag_pairs(
+        pairs = await resolve_tag_pairs(
+            git_source,
             tags,
             last_releases=last_releases,
             since=effective_since,

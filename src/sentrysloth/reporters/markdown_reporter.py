@@ -39,8 +39,21 @@ def generate_markdown_report(result: ScanResult) -> str:
         lines.append(f"- Filtered out: {result.triage_stats.filtered_out}")
     lines.append("")
 
+    lines.append(f"- Analysis complete: {result.complete}")
+    lines.append(f"- Comparison: {result.release.relationship}")
+    lines.append(f"- Source commits: `{result.release.from_sha}` -> `{result.release.to_sha}`")
+    for issue in result.coverage_issues:
+        lines.append(f"- Coverage issue: {issue}")
+    if result.candidates:
+        lines.extend(["", "## Candidate review queue", ""])
+        for item in result.candidates:
+            lines.append(
+                f"- **{item.status.value}**: {item.title} ({item.file_path}) — {item.review_reason}"
+            )
+            for missing in item.missing_evidence:
+                lines.append(f"  - Missing: {missing}")
     if not result.findings:
-        lines.append("No security-relevant findings detected.")
+        lines.append("No confirmed findings. This is not proof that the compared code is secure.")
         return "\n".join(lines)
 
     # Findings by severity
@@ -64,7 +77,7 @@ def generate_markdown_report(result: ScanResult) -> str:
             lines.append("")
             lines.append(
                 f"**Type**: {f.finding_type.value} | "
-                f"**Confidence**: {f.confidence.value} | "
+                f"**Confidence**: {f.confidence.value} | **Status**: {f.status.value} | "
                 f"**ID**: `{f.finding_id}`"
             )
             lines.append("")
@@ -82,7 +95,10 @@ def generate_markdown_report(result: ScanResult) -> str:
                 lines.append(f"**Evidence {i}**: {ev.description}")
                 if ev.code.snippet:
                     lines.append("```")
-                    lines.append(f"// {ev.code.file_path}:{ev.code.start_line}-{ev.code.end_line}")
+                    lines.append(
+                        f"// {ev.code.file_path}:{ev.code.start_line}-{ev.code.end_line} "
+                        f"@{ev.code.commit_sha} ({ev.code.revision})"
+                    )
                     lines.append(ev.code.snippet)
                     lines.append("```")
                 lines.append(f"*Reasoning*: {ev.reasoning}")
@@ -103,6 +119,10 @@ def generate_markdown_report(result: ScanResult) -> str:
         lines.append(f"- Triage tokens: out={result.llm_metrics.triage_output_tokens}")
         lines.append(f"- Analysis tokens: in={result.llm_metrics.analysis_input_tokens}")
         lines.append(f"- Analysis tokens: out={result.llm_metrics.analysis_output_tokens}")
+        lines.append(
+            f"- Verification tokens: in={result.llm_metrics.verification_input_tokens}, "
+            f"out={result.llm_metrics.verification_output_tokens}"
+        )
         lines.append(f"- Triage latency: {result.llm_metrics.triage_latency_ms:.0f}ms")
         lines.append(f"- Analysis latency: {result.llm_metrics.analysis_latency_ms:.0f}ms")
         lines.append("")

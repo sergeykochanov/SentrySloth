@@ -1,0 +1,128 @@
+[
+  {
+    "case_id": "guard-order",
+    "split": "development",
+    "label": "positive",
+    "reason": "The protected operation runs before authorization.",
+    "before": {
+      "app.py": "def handle(request):\n    require_admin(request)\n    return delete_account(request.account_id)\n"
+    },
+    "after": {
+      "app.py": "def handle(request):\n    result = delete_account(request.account_id)\n    require_admin(request)\n    return result\n"
+    },
+    "expected": [
+      {
+        "file_path": "app.py",
+        "anchor": "result = delete_account(request.account_id)"
+      }
+    ]
+  },
+  {
+    "case_id": "indentation-auth",
+    "split": "holdout",
+    "label": "positive",
+    "reason": "A regular user can now reach an admin operation because authorization was moved into the debug branch.",
+    "before": {
+      "app.py": "def handle(request, debug=False):\n    if debug:\n        log(request)\n    require_admin(request)\n    return delete_account(request.account_id)\n"
+    },
+    "after": {
+      "app.py": "def handle(request, debug=False):\n    if debug:\n        log(request)\n        require_admin(request)\n    return delete_account(request.account_id)\n"
+    },
+    "expected": [
+      {
+        "file_path": "app.py",
+        "anchor": "        require_admin(request)"
+      }
+    ]
+  },
+  {
+    "case_id": "commented-guard",
+    "split": "development",
+    "label": "positive",
+    "reason": "The only authorization call was disabled.",
+    "before": {
+      "app.py": "def handle(request):\n    require_admin(request)\n    return delete_account(request.account_id)\n"
+    },
+    "after": {
+      "app.py": "def handle(request):\n    # require_admin(request)\n    return delete_account(request.account_id)\n"
+    },
+    "expected": [
+      {
+        "file_path": "app.py",
+        "anchor": "# require_admin(request)"
+      }
+    ]
+  },
+  {
+    "case_id": "moved-guard",
+    "split": "development",
+    "label": "negative",
+    "reason": "The moved helper still runs the same authorization before the protected operation.",
+    "before": {
+      "app.py": "def handle(request):\n    require_admin(request)\n    return delete_account(request.account_id)\n"
+    },
+    "after": {
+      "app.py": "def checked_delete(request):\n    require_admin(request)\n    return delete_account(request.account_id)\n\ndef handle(request):\n    return checked_delete(request)\n"
+    },
+    "expected": []
+  },
+  {
+    "case_id": "reject-malformed",
+    "split": "development",
+    "label": "negative",
+    "reason": "Returning HTTP 400 rejects one invalid request; it is not process-wide denial of service.",
+    "before": {
+      "app.py": "def handle(request):\n    return parse_header(request.header)\n"
+    },
+    "after": {
+      "app.py": "def handle(request):\n    if len(request.header) > 8192:\n        return Response(status=400)\n    return parse_header(request.header)\n"
+    },
+    "expected": []
+  },
+  {
+    "case_id": "output-guard",
+    "split": "holdout",
+    "label": "negative",
+    "reason": "Input normalization changed, but the same output containment check remains before file access.",
+    "before": {
+      "app.py": "def read_asset(root, name):\n    path = (root / name).resolve()\n    if not path.is_relative_to(root.resolve()):\n        raise ValueError(\"outside root\")\n    return path.read_bytes()\n"
+    },
+    "after": {
+      "app.py": "def read_asset(root, name):\n    name = name.replace(\"\\\\\", \"/\")\n    path = (root / name).resolve()\n    if not path.is_relative_to(root.resolve()):\n        raise ValueError(\"outside root\")\n    return path.read_bytes()\n"
+    },
+    "expected": []
+  },
+  {
+    "case_id": "streaming-fix-gap",
+    "split": "holdout",
+    "label": "positive",
+    "reason": "The limit fix only covers known-length streams while read still consumes an unbounded stream.",
+    "before": {
+      "app.py": "def parse_form(stream, length, limit):\n    return decode(stream.read())\n"
+    },
+    "after": {
+      "app.py": "def parse_form(stream, length, limit):\n    if length is not None and length > limit:\n        raise ValueError(\"too large\")\n    return decode(stream.read())\n"
+    },
+    "expected": [
+      {
+        "file_path": "app.py",
+        "anchor": "return decode(stream.read())"
+      }
+    ]
+  },
+  {
+    "case_id": "unknown-dependency",
+    "split": "holdout",
+    "label": "unresolved",
+    "reason": "The removed guard may have moved to the upgraded dependency; its source is absent, so do not label this automatically.",
+    "before": {
+      "app.py": "from dependency import parse\n\ndef handle(request):\n    if len(request.body) > 8192:\n        raise ValueError(\"too large\")\n    return parse(request.body)\n",
+      "requirements.txt": "dependency==1.0\n"
+    },
+    "after": {
+      "app.py": "from dependency import parse\n\ndef handle(request):\n    return parse(request.body)\n",
+      "requirements.txt": "dependency==2.0\n"
+    },
+    "expected": []
+  }
+]

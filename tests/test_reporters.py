@@ -66,7 +66,7 @@ def test_json_and_markdown_handle_empty_findings():
     markdown_payload = generate_markdown_report(result)
 
     assert json_payload["findings"] == []
-    assert "No security-relevant findings detected." in markdown_payload
+    assert "No confirmed findings." in markdown_payload
 
 
 def test_sarif_smoke_with_single_finding():

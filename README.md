@@ -4,14 +4,14 @@ Security-focused code review assistant for open-source releases.
 
 ## What is it?
 
-SentrySloth is an LLM-powered tool that analyzes diffs between software releases to find security-relevant changes. It uses a two-stage pipeline — fast triage followed by deep analysis — and outputs results in SARIF (for GitHub Code Scanning), Markdown, or JSON formats.
+SentrySloth is an LLM-powered tool that analyzes diffs between software releases to find security-relevant changes. It uses a three-stage pipeline — fast triage, deep analysis, then independent candidate verification — and outputs results in SARIF (for GitHub Code Scanning), Markdown, or JSON formats.
 
 ## Features
 
-- **Two-stage pipeline**: fast triage filters noise, deep analysis examines only security-relevant chunks
+- **Evidence-based review**: triage, discovery and independent verification with exact source citations
 - **Multiple output formats**: JSON (default), Markdown reports, SARIF for GitHub Code Scanning integration
-- **SQLite caching**: scan history and accumulated repository profile across releases
-- **Accumulating RepoProfile memory**: bootstrap context for a new repository, then incrementally update it after each scan
+- **SQLite caching**: scan history and revision-scoped repository profiles
+- **Regression and patch review**: investigate newly introduced bugs and incomplete fixes; compare actual Git ancestry
 - **Baseline suppression**: mark known findings to exclude from future reports
 - **Configurable severity/confidence thresholds**: fail CI builds on findings above a chosen severity
 - **Typed Python package** with PEP 561 support
@@ -69,7 +69,7 @@ All settings are controlled via environment variables with the `SENTRYSLOTH_` pr
 | `SENTRYSLOTH_LLM_TOTAL_TIMEOUT` | Total request timeout (seconds) | `300.0` |
 | `SENTRYSLOTH_CACHE_ENABLED` | Enable SQLite cache | `true` |
 | `SENTRYSLOTH_CACHE_DB_PATH` | Cache database path | `~/.cache/sentrysloth/cache.db` |
-| `SENTRYSLOTH_CACHE_REPO_PROFILE_ENABLED` | Enable accumulated RepoProfile context | `true` |
+| `SENTRYSLOTH_CACHE_REPO_PROFILE_ENABLED` | Enable revision-scoped RepoProfile context | `true` |
 | `SENTRYSLOTH_CACHE_REPO_PROFILE_HISTORY_ENABLED` | Store per-scan RepoProfile snapshots | `false` |
 | `SENTRYSLOTH_CACHE_REPO_PROFILE_MAX_CHARS` | Max chars injected from RepoProfile into prompts | `6000` |
 | `SENTRYSLOTH_CACHE_REPO_PROFILE_MAX_ITEMS` | Max items per list field in RepoProfile | `24` |
@@ -140,6 +140,61 @@ sentrysloth cache-info https://github.com/org/repo
 sentrysloth repo-profile https://github.com/org/repo
 ```
 
+## Review modes and evidence
+
+```bash
+sentrysloth scan ./project --from v1.0 --to v1.1 --mode both
+sentrysloth scan ./project --from v1.0 --to v1.1 --mode patch
+sentrysloth scan ./project --from v1.0 --to v1.1 --no-verify
+```
+
+`both` is the default. Patch review checks the intended security invariant against
+sibling code paths, drivers, normalization, streaming and concurrency. Tools can
+read changed tests and dependency manifests even when those files are excluded
+from initial diff analysis.
+
+The verifier uses a fresh conversation with the analysis model and seeks counterevidence.
+`confirmed_static` means source inspection with matching citations, not a reproduced
+exploit or maintainer acceptance. Missing reachability, dependency behavior or citations
+keeps a hypothesis in `candidates` as `needs_review`. Refuted candidates are retained as
+`rejected`. Only confirmed findings enter SARIF and `--fail-on` decisions.
+`--no-verify` skips verification and produces candidates only.
+
+Every scan pins the two refs to SHAs. Batch mode defaults to `--pairing-mode ancestry`:
+each semantic-version release is compared with an older ancestor, preferring its own
+major/minor stream. Legacy `chronological` and `per-major` modes remain available.
+Non-version tags require an explicit comparison or a legacy pairing mode.
+Divergent refs can be inspected directly, but cannot confirm a `security_regression`.
+
+Exit codes: **0** completed, **1** confirmed finding meets `--fail-on`, **2** setup error,
+**3** incomplete analysis. Inspect `complete`, `coverage_issues`, `release.excluded_paths`,
+triage statistics and `candidates`; an empty findings list does not establish security.
+Completion describes the selected scope, not exhaustive coverage of the repository.
+Verification adds model calls. Set `SENTRYSLOTH_VERIFICATION_MAX_TURNS` to bound its turns.
+Token counts with `token_usage_complete=false` are a lower bound after failed requests.
+
+The heuristic prefilter is disabled by default (`SENTRYSLOTH_PREFILTER_MIN_SECURITY_SCORE=0`).
+Raising it saves model calls but can miss changes; dropped counts are recorded.
+
+### Migrating from 0.1
+
+Finding IDs now include root cause and source anchors. Regenerate baselines from reviewed
+0.2 reports; old hunk-based IDs could hide multiple unrelated findings and are not matched
+automatically. Old cached reports remain readable and are not retroactively verified.
+Source strings are preserved inside untrusted data instead of being destructively sanitized.
+
+### Evaluate saved scans
+
+See [evaluation/README.md](evaluation/README.md) for the synthetic suite and procedure.
+
+```bash
+python scripts/prepare_evaluation.py /tmp/sentrysloth-eval
+sentrysloth evaluate /tmp/sentrysloth-eval/dataset.json ./reports --split holdout --top 10
+```
+
+No live-model precision or recall gain is claimed by this release. Compare old and new
+runs on identical SHAs and a separate holdout set before tuning prompts or thresholds.
+
 ## Output Formats
 
 - **JSON** (default): structured scan result with all findings and metadata
@@ -151,7 +206,7 @@ sentrysloth repo-profile https://github.com/org/repo
 ```
 Git Source
   |
-  +--> RepoProfile Bootstrap (new repo only, metadata + file tree)
+  +--> RepoProfile Bootstrap (exact revision, metadata + file tree)
   |        |
   |        v
   |     SQLite Cache (repo_profiles)
@@ -163,7 +218,10 @@ Diff Extractor --> Chunks
 Triage (fast model) --> Filter security-relevant chunks
   |
   v
-Deep / Agentic Analysis (analysis model) + RepoProfile context --> Findings
+Deep / Agentic Analysis + revision context --> Candidates
+  |
+  v
+Independent Verification + exact citations --> Confirmed / Needs review / Rejected
   |
   v
 RepoProfile Incremental Update (triage model) --> SQLite Cache

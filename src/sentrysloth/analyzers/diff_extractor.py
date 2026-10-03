@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import deque
 from pathlib import PurePosixPath
 
 from unidiff import PatchedFile, PatchSet, UnidiffParseError
@@ -182,46 +183,23 @@ def _extract_changed_lines(raw_diff: str) -> str:
     return "\n".join(lines)
 
 
-_COMMENT_PREFIX_RE = re.compile(r"^\s*(?://|#|/\*|\*/?\s*|\*)\s*")
-
-
 def _is_noise_only_change(raw_diff: str) -> bool:
-    """Detect whitespace-only or comment-only changes.
+    """Only discard byte-identical changed lines, preserving order and indentation.
 
-    Compares added vs removed lines after normalising whitespace (and
-    optionally stripping comment prefixes).  When the normalised sets are
-    equal the diff is cosmetic.
+    Whitespace, comments and reordering can change program semantics. Without a
+    language parser none of these transformations is safe to treat as cosmetic.
     """
-    added: list[str] = []
-    removed: list[str] = []
-    for line in raw_diff.splitlines():
-        if line.startswith(("+++", "---")):
-            continue
-        if line.startswith("+"):
-            added.append(line[1:])
-        elif line.startswith("-"):
-            removed.append(line[1:])
-
-    if not added and not removed:
-        return True
-
-    def _normalize_ws(lines: list[str]) -> list[str]:
-        return sorted("".join(s.split()) for s in lines)
-
-    if _normalize_ws(added) == _normalize_ws(removed):
-        return True
-
-    def _strip_comments(lines: list[str]) -> list[str]:
-        return sorted("".join(_COMMENT_PREFIX_RE.sub("", s).split()) for s in lines)
-
-    if _strip_comments(added) == _strip_comments(removed):
-        return True
-
-    def _is_comment_line(line: str) -> bool:
-        stripped = line.lstrip()
-        return stripped.startswith(("#", "//", "/*", "*/", "*"))
-
-    return all(_is_comment_line(s) for s in added) and all(_is_comment_line(s) for s in removed)
+    added = [
+        line[1:]
+        for line in raw_diff.splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ]
+    removed = [
+        line[1:]
+        for line in raw_diff.splitlines()
+        if line.startswith("-") and not line.startswith("---")
+    ]
+    return added == removed
 
 
 def _path_boost_weight(file_path: str) -> float:
@@ -273,18 +251,11 @@ def estimate_tokens(text: str) -> int:
 
 
 def sanitize_diff_content(content: str) -> str:
-    """Strip potential prompt-injection patterns from diff content."""
-    # Remove markdown code fences that could confuse LLM
-    content = re.sub(r"```[\s\S]*?```", "[CODE_BLOCK_REMOVED]", content)
-    # Remove XML-like tags (opening and closing) that could be interpreted as instructions
-    tag_pattern = r"</?(?:system|user|assistant|instruction)[^>]*>"
-    content = re.sub(tag_pattern, "[TAG_REMOVED]", content, flags=re.I)
-    # Remove bracket-style injection markers
-    bracket_pattern = r"\[(?:SYSTEM|INST|/INST)\]"
-    content = re.sub(bracket_pattern, "[TAG_REMOVED]", content, flags=re.I)
-    # Remove role-play injection patterns
-    role_pattern = r"^(?:Human|Assistant|System)\s*:"
-    content = re.sub(role_pattern, "[TAG_REMOVED]:", content, flags=re.I | re.MULTILINE)
+    """Preserve source bytes. Repository content is untrusted data, not instructions.
+
+    Deleting fences or role markers can erase vulnerable code and invalidate
+    evidence offsets. Tool permissions and prompt roles provide the boundary.
+    """
     return content
 
 
@@ -347,7 +318,7 @@ def _chunk_patched_file(
         hunk_text = str(hunk)
         hunk_tokens = estimate_tokens(hunk_text)
 
-        # If single hunk exceeds budget, it gets its own chunk (possibly truncated)
+        # If single hunk exceeds budget, split on complete lines without discarding the tail
         if hunk_tokens > budget:
             # Flush current accumulator
             if current_hunks:
@@ -356,18 +327,30 @@ def _chunk_patched_file(
                 current_raw = ""
                 current_tokens = 0
 
-            truncated_text = _truncate_to_budget(hunk_text, budget)
-            diff_hunk = DiffHunk(
-                source_start=hunk.source_start,
-                source_length=hunk.source_length,
-                target_start=hunk.target_start,
-                target_length=hunk.target_length,
-                content=truncated_text,
-                header=str(hunk).split("\n", 1)[0] if str(hunk) else "",
-            )
-            chunks.append(
-                _make_chunk(file_path, [diff_hunk], truncated_text, language, truncated=True)
-            )
+            source_line, target_line = hunk.source_start, hunk.target_start
+            lines = deque(hunk)
+            while lines:
+                segment = []
+                size = 0
+                while lines and (not segment or size + len(str(lines[0])) <= budget * 4):
+                    line = lines.popleft()
+                    segment.append(line)
+                    size += len(str(line))
+                source_length = sum(line.is_removed or line.is_context for line in segment)
+                target_length = sum(line.is_added or line.is_context for line in segment)
+                header = f"@@ -{source_line},{source_length} +{target_line},{target_length} @@"
+                text = header + "\n" + "".join(str(line) for line in segment)
+                part = DiffHunk(
+                    source_start=source_line,
+                    source_length=source_length,
+                    target_start=target_line,
+                    target_length=target_length,
+                    content=text,
+                    header=header,
+                )
+                chunks.append(_make_chunk(file_path, [part], text, language))
+                source_line += source_length
+                target_line += target_length
             continue
 
         # If adding this hunk would exceed budget, flush
@@ -442,6 +425,7 @@ def _fallback_chunk(diff_text: str, settings: Settings) -> list[DiffChunk]:
     return [
         DiffChunk(
             file_path="<unknown>",
+            truncated=True,
             hunks=[],
             raw_diff=sanitized,
             token_estimate=estimate_tokens(sanitized),

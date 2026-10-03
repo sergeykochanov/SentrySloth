@@ -116,7 +116,7 @@ async def test_cache_hit_skips_bootstrap_call(tmp_path):
         settings,
         _mock_git_source(),
         "repo-url",
-        "v1.1",
+        "v1.0",
     )
     assert loaded is not None
     assert loaded.overview == ["cached"]

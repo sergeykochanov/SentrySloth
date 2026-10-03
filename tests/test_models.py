@@ -67,8 +67,10 @@ class TestFinding:
                 )
             ],
         )
-        # Same repo + file + hunk_signature + finding_type => same ID
-        assert f1.finding_id == f2.finding_id
+        # Independent evidence in the same hunk must not collapse.
+        assert f1.finding_id != f2.finding_id
+        assert f1.legacy_finding_id == f2.legacy_finding_id
+        assert f1.model_copy(deep=True).finding_id == f1.finding_id
 
     def test_different_finding_id_for_different_type(self):
         base = dict(

@@ -22,17 +22,19 @@ from sentrysloth import __version__
 from sentrysloth.batch import (
     BatchError,
     BatchResult,
-    build_tag_pairs,
     load_repo_list,
     normalize_since_for_tag_dates,
     repo_name_from_url,
     resolve_tag_fetch_limit,
+    resolve_tag_pairs,
     run_batch_scan,
 )
 from sentrysloth.cache.storage import CacheStorage
 from sentrysloth.config import Settings, get_settings
+from sentrysloth.evaluation import EvaluationDataset, evaluate_reports, load_reports
 from sentrysloth.models import (
     RepoProfile,
+    ScanMode,
     ScanResult,
     Severity,
 )
@@ -243,6 +245,12 @@ def _output_result(
 
 
 def _print_summary(result: ScanResult, *, show_empty: bool = True) -> None:
+    if not result.complete:
+        console.print(
+            f"[yellow]Incomplete scan: {len(result.coverage_issues)} coverage issues.[/yellow]"
+        )
+    if result.candidates:
+        console.print(f"Candidate review queue: {len(result.candidates)}")
     if not result.findings:
         if not show_empty:
             return
@@ -256,7 +264,7 @@ def _print_summary(result: ScanResult, *, show_empty: bool = True) -> None:
             ctx = f" {repo} (scan {result.scan_id})"
         else:
             ctx = f" (scan {result.scan_id})"
-        console.print(f"[green]No findings.[/green]{ctx}")
+        console.print(f"No confirmed findings.{ctx}")
         return
 
     summary_title = "Findings Summary"
@@ -345,6 +353,12 @@ def scan(
     fail_on: str | None = typer.Option(None, "--fail-on", help="Exit 1 if findings >= severity"),
     min_confidence: str = typer.Option("low", "--min-confidence", help="Minimum confidence filter"),
     baseline: str | None = typer.Option(None, "--baseline", help="Baseline file for suppression"),
+    mode: ScanMode = typer.Option(  # noqa: B008
+        ScanMode.BOTH, "--mode", help="regression, patch, or both"
+    ),
+    verify: bool = typer.Option(
+        True, "--verify/--no-verify", help="Independently verify candidates"
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
     """Scan a repository for security-relevant changes between two refs."""
@@ -352,6 +366,8 @@ def scan(
 
     overrides: dict = {
         "verbose": verbose,
+        "scan_mode": mode,
+        "verify_findings": verify,
         "min_confidence": min_confidence,
     }
     if fail_on:
@@ -371,6 +387,32 @@ def scan(
         )
     )
     raise typer.Exit(code=exit_code)
+
+
+@app.command("evaluate")
+def evaluate(
+    dataset: Path = typer.Argument(  # noqa: B008
+        help="Labeled dataset JSON with exact commit SHAs"
+    ),
+    reports: Path = typer.Argument(  # noqa: B008
+        help="Directory containing JSON scan reports"
+    ),
+    split: str = typer.Option("holdout", "--split"),
+    k: int = typer.Option(10, "--top", min=1),
+    review_minutes: float | None = typer.Option(None, "--review-minutes", min=0),
+) -> None:
+    """Measure a saved run offline. Keep old/new run reports in separate directories."""
+    try:
+        data = EvaluationDataset.model_validate_json(dataset.read_text(encoding="utf-8"))
+        if split not in {"holdout", "development"}:
+            raise ValueError("split must be holdout or development")
+        result = evaluate_reports(
+            data, load_reports(reports), split=split, k=k, review_minutes=review_minutes
+        )
+    except (OSError, ValueError) as exc:
+        console.print(f"[red]Evaluation failed:[/red] {exc}")
+        raise typer.Exit(code=EXIT_ERROR) from exc
+    output_console.print_json(data=result)
 
 
 @app.command("list-versions")
@@ -600,14 +642,18 @@ def batch_scan(
         help="Max parallel repositories (pairs in a repo run old->new sequentially)",
     ),
     pairing_mode: str = typer.Option(
-        "per-major",
+        "ancestry",
         "--pairing-mode",
         help=(
-            "How to build tag pairs: chronological | per-major "
+            "How to build tag pairs: ancestry | chronological | per-major "
             "(for --last-releases both use latest-major-first selection)"
         ),
         show_default=True,
     ),
+    mode: ScanMode = typer.Option(  # noqa: B008
+        ScanMode.BOTH, "--mode"
+    ),
+    verify: bool = typer.Option(True, "--verify/--no-verify"),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show what would be scanned"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
 ) -> None:
@@ -637,19 +683,17 @@ def batch_scan(
 
     console.print(f"Loaded {len(repos)} repos from {repos_file}")
 
-    settings = get_settings(verbose=verbose)
+    settings = get_settings(verbose=verbose, scan_mode=mode, verify_findings=verify)
 
     pairing_mode_norm = pairing_mode.strip().lower().replace("-", "_")
-    if pairing_mode_norm not in {"chronological", "per_major"}:
+    if pairing_mode_norm not in {"chronological", "per_major", "ancestry"}:
         console.print(
             "[red]Error:[/red] invalid --pairing-mode "
-            f"{pairing_mode!r} (expected chronological|per-major)"
+            f"{pairing_mode!r} (expected ancestry|chronological|per-major)"
         )
         raise typer.Exit(code=EXIT_ERROR)
 
-    pairing_mode_value: Literal["chronological", "per_major"] = (
-        "chronological" if pairing_mode_norm == "chronological" else "per_major"
-    )
+    pairing_mode_value = pairing_mode_norm
 
     if dry_run:
         exit_code = asyncio.run(
@@ -789,7 +833,7 @@ async def _dry_run_batch(
     *,
     last_releases: int | None = None,
     since: datetime | None = None,
-    pairing_mode: Literal["chronological", "per_major"] = "chronological",
+    pairing_mode: Literal["chronological", "per_major", "ancestry"] = "ancestry",
 ) -> int:
     """Clone/fetch repos, list tag pairs, print what would be scanned."""
     table = Table(title="Dry Run: Planned Scans")
@@ -820,7 +864,8 @@ async def _dry_run_batch(
 
         effective_since = normalize_since_for_tag_dates(since, tag_dates)
 
-        pairs = build_tag_pairs(
+        pairs = await resolve_tag_pairs(
+            git_source,
             tags,
             last_releases=last_releases,
             since=effective_since,

@@ -145,6 +145,7 @@ def _normalize_profile(
         )
 
     profile.repo = repo
+    profile.known_risks = []
     profile.last_ref = last_ref
     profile.updated_at = datetime.now(UTC)
     _cap_and_sanitize(profile, max_items)
@@ -347,7 +348,7 @@ async def load_or_bootstrap_repo_profile(
         return None
 
     existing = await cache.get_repo_profile(repo)
-    if existing is not None:
+    if existing is not None and existing.get("last_ref") == to_ref:
         try:
             return _normalize_profile(
                 RepoProfile.model_validate(existing),

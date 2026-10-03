@@ -144,6 +144,50 @@ class GitSource:
         except GitCommandError as exc:
             raise GitSourceError(f"Failed to diff {from_ref}..{to_ref}: {exc}") from exc
 
+    async def resolve_ref(self, ref: str) -> str:
+        await self._validate_ref(ref)
+        return await asyncio.to_thread(lambda: self.repo.commit(ref).hexsha)
+
+    async def is_ancestor(self, before: str, after: str) -> bool:
+        await self._validate_ref(before)
+        await self._validate_ref(after)
+        try:
+            await asyncio.to_thread(self.repo.git.merge_base, "--is-ancestor", before, after)
+            return True
+        except GitCommandError as exc:
+            if exc.status == 1:
+                return False
+            raise GitSourceError(f"Cannot establish ancestry: {exc}") from exc
+
+    async def changed_files(self, before: str, after: str) -> list[str]:
+        await self._validate_ref(before)
+        await self._validate_ref(after)
+        try:
+            raw = await asyncio.to_thread(self.repo.git.diff, "--name-only", "-z", before, after)
+            return [path for path in raw.split("\x00") if path]
+        except GitCommandError as exc:
+            raise GitSourceError(f"Cannot list changed files: {exc}") from exc
+
+    async def get_file_diff(self, before: str, after: str, path: str) -> str:
+        if not self._is_safe_file_path(path):
+            raise GitSourceError(f"Unsafe file path: {path}")
+        await self._validate_ref(before)
+        await self._validate_ref(after)
+        try:
+            return await asyncio.to_thread(self.repo.git.diff, before, after, "--", path)
+        except GitCommandError as exc:
+            raise GitSourceError(f"Cannot read file diff: {exc}") from exc
+
+    async def commit_messages(self, before: str, after: str) -> str:
+        await self._validate_ref(before)
+        await self._validate_ref(after)
+        try:
+            return await asyncio.to_thread(
+                self.repo.git.log, "--format=%h %s", "-20", f"{before}..{after}"
+            )
+        except GitCommandError as exc:
+            raise GitSourceError(f"Cannot read commit subjects: {exc}") from exc
+
     async def get_diff_stat(self, from_ref: str, to_ref: str) -> dict[str, int]:
         """Get diff statistics: files changed, additions, deletions."""
         await self._validate_ref(from_ref)
@@ -198,13 +242,14 @@ class GitSource:
         *,
         file_glob: str = "",
         max_results: int = 20,
+        offset: int = 0,
     ) -> list[dict]:
         """Search code in repo at a given ref using git grep.
 
         Returns list of {"file": str, "line": int, "content": str}.
         """
         await self._validate_ref(ref)
-        args = ["-n", "--max-count", str(max_results), "-F", "-e", pattern, ref]
+        args = ["-n", "--max-count", str(max_results + offset), "-F", "-e", pattern, ref]
         if file_glob:
             args.extend(["--", file_glob])
         try:
@@ -235,9 +280,9 @@ class GitSource:
                 )
             except ValueError:
                 continue
-            if len(results) >= max_results:
+            if len(results) >= max_results + offset:
                 break
-        return results
+        return results[offset : offset + max_results]
 
     @staticmethod
     def _is_missing_file_error(exc: GitCommandError) -> bool:

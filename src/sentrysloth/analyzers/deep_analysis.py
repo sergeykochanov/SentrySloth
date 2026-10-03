@@ -70,22 +70,13 @@ async def _analyze_chunk_with_metrics(
 ) -> tuple[list[Finding], int, int, float]:
     prompt = build_analysis_prompt(chunk, triage, project_summary)
 
-    try:
-        response = await provider.generate_structured(
-            prompt=prompt,
-            response_model=AnalysisResponse,
-            model=settings.llm.analysis_model,
-            temperature=settings.llm.analysis_temperature,
-            max_output_tokens=4096,
-        )
-    except LLMQuotaExceededError as exc:
-        if settings.llm.quota_exhausted_mode == QuotaExhaustedMode.FAIL_FAST:
-            raise
-        logger.warning("Deep analysis quota fallback for %s: %s", chunk.file_path, exc)
-        return [], 0, 0, 0.0
-    except LLMProviderError as exc:
-        logger.error("Deep analysis failed for %s: %s", chunk.file_path, exc)
-        return [], 0, 0, 0.0
+    response = await provider.generate_structured(
+        prompt=prompt,
+        response_model=AnalysisResponse,
+        model=settings.llm.analysis_model,
+        temperature=settings.llm.analysis_temperature,
+        max_output_tokens=4096,
+    )
 
     findings = filter_and_convert_findings(response.data.findings, repo, chunk)
     return findings, response.input_tokens, response.output_tokens, response.latency_ms
@@ -114,6 +105,8 @@ async def run_deep_analysis(
     if use_agentic:
         max_in_flight = min(max_in_flight, 2)
 
+    fallback_files: set[str] = set()
+
     async def _worker(
         idx: int,
         pair: tuple[DiffChunk, TriageResult],
@@ -136,12 +129,14 @@ async def run_deep_analysis(
             except NotImplementedError:
                 logger.info("Provider does not support tool use, falling back to single-turn")
             except AgenticParseError as exc:
+                fallback_files.add(chunk.file_path)
                 logger.warning(
                     "agentic_fallback_singleturn reason=parse_error_after_repair file=%s: %s",
                     chunk.file_path,
                     exc,
                 )
             except LLMProviderError as exc:
+                fallback_files.add(chunk.file_path)
                 logger.warning(
                     "Agentic analysis failed for %s: %s, falling back", chunk.file_path, exc
                 )
@@ -156,7 +151,20 @@ async def run_deep_analysis(
         )
         return idx, findings, in_tok, out_tok, elapsed
 
-    rows = await run_bounded_pool(relevant_chunks, _worker, max_in_flight)
+    errors: list[str] = []
+
+    async def safe_worker(idx, pair):
+        try:
+            return await _worker(idx, pair)
+        except LLMQuotaExceededError as exc:
+            if settings.llm.quota_exhausted_mode == QuotaExhaustedMode.FAIL_FAST:
+                raise
+            errors.append(f"{pair[0].file_path}: {exc}")
+        except LLMProviderError as exc:
+            errors.append(f"{pair[0].file_path}: {exc}")
+        return idx, [], 0, 0, 0.0
+
+    rows = await run_bounded_pool(relevant_chunks, safe_worker, max_in_flight)
 
     elapsed_ms = (time.monotonic() - start) * 1000
 
@@ -180,6 +188,9 @@ async def run_deep_analysis(
         analysis_input_tokens=analysis_input_tokens,
         analysis_output_tokens=analysis_output_tokens,
         analysis_latency_ms=elapsed_ms,
+        analysis_completed=len(rows) - len(errors),
+        errors=errors,
+        token_usage_complete=not errors and not fallback_files,
     )
 
     logger.info(

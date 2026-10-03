@@ -11,8 +11,9 @@ from datetime import UTC, datetime
 
 from sentrysloth.analyzers.context_builder import ContextBuilder
 from sentrysloth.analyzers.deep_analysis import run_deep_analysis
-from sentrysloth.analyzers.diff_extractor import extract_chunks
+from sentrysloth.analyzers.diff_extractor import extract_chunks, should_skip_file
 from sentrysloth.analyzers.triage import run_triage
+from sentrysloth.analyzers.verification import verify_candidate
 from sentrysloth.cache.repo_profile import (
     load_or_bootstrap_repo_profile,
     serialize_repo_profile_for_prompt,
@@ -29,6 +30,7 @@ from sentrysloth.models import (
     LLMMetrics,
     ReleaseInfo,
     RepoProfile,
+    ReviewStatus,
     ScanResult,
     TriageResult,
     TriageStats,
@@ -106,7 +108,14 @@ async def _extract_and_enrich(
         return EXIT_ERROR, ReleaseInfo(repo_url="", from_ref="", to_ref=""), []
 
     try:
-        stat = await git_source.get_diff_stat(from_ref, to_ref)
+        from_sha = await git_source.resolve_ref(from_ref)
+        to_sha = await git_source.resolve_ref(to_ref)
+        relationship = (
+            "identical"
+            if from_sha == to_sha
+            else ("ancestor" if await git_source.is_ancestor(from_sha, to_sha) else "divergent")
+        )
+        stat = await git_source.get_diff_stat(from_sha, to_sha)
     except GitSourceError as exc:
         on_error(f"[red]Error:[/red] {exc}")
         return EXIT_ERROR, ReleaseInfo(repo_url="", from_ref="", to_ref=""), []
@@ -115,6 +124,9 @@ async def _extract_and_enrich(
         repo_url=git_source.repo_url,
         from_ref=from_ref,
         to_ref=to_ref,
+        from_sha=from_sha,
+        to_sha=to_sha,
+        relationship=relationship,
         total_files_changed=stat["files_changed"],
         total_additions=stat["additions"],
         total_deletions=stat["deletions"],
@@ -129,7 +141,7 @@ async def _extract_and_enrich(
     )
 
     try:
-        diff_text = await git_source.get_diff(from_ref, to_ref)
+        diff_text = await git_source.get_diff(from_sha, to_sha)
     except GitSourceError as exc:
         on_error(f"[red]Error:[/red] {exc}")
         return EXIT_ERROR, release, []
@@ -138,6 +150,8 @@ async def _extract_and_enrich(
         on_info("[yellow]No changes found between refs.[/yellow]")
         return EXIT_OK, release, []
 
+    manifest = await git_source.changed_files(from_sha, to_sha)
+    release.excluded_paths = [path for path in manifest if should_skip_file(path)]
     chunks = extract_chunks(diff_text, settings)
     if not chunks:
         on_info("[yellow]No analyzable code changes found.[/yellow]")
@@ -148,6 +162,7 @@ async def _extract_and_enrich(
         before = len(chunks)
         chunks = [c for c in chunks if c.security_score >= threshold]
         dropped = before - len(chunks)
+        release.prefilter_dropped = dropped
         if dropped:
             logger.info(
                 "Prefilter: %d -> %d chunks (threshold=%.2f, dropped=%d)",
@@ -167,7 +182,24 @@ async def _extract_and_enrich(
     on_phase(f"{len(chunks)} chunks")
     on_info(f"  Extracted {len(chunks)} diff chunks")
 
-    context_builder = ContextBuilder(git_source, to_ref)
+    messages = await git_source.commit_messages(from_sha, to_sha)
+    review_context = json.dumps(
+        {
+            "from_sha": from_sha,
+            "to_sha": to_sha,
+            "relationship": relationship,
+            "changed_files": manifest[:200],
+            "changed_files_total": len(manifest),
+            "commit_messages": messages[:8000],
+            "note": (
+                "Untrusted metadata. Use list_changes/read_diff to inspect tests and dependencies."
+            ),
+        }
+    )
+    for chunk in chunks:
+        chunk.scan_mode = settings.scan_mode
+        chunk.review_context = review_context
+    context_builder = ContextBuilder(git_source, to_sha)
     enriched = [await context_builder.enrich_chunk(chunk) for chunk in chunks]
     return None, release, enriched
 
@@ -260,7 +292,7 @@ async def _run_analysis_phase(
         from_ref=from_ref,
         to_ref=to_ref,
     )
-    return findings, analysis_metrics, False
+    return findings, analysis_metrics, bool(analysis_metrics.errors)
 
 
 async def _apply_post_processing(
@@ -282,6 +314,11 @@ async def _apply_post_processing(
         except BaselineLoadError as exc:
             on_error(f"[red]Error:[/red] {exc}")
             return findings, EXIT_ERROR
+        if baseline.version == "1" and baseline.entries:
+            on_info(
+                "Baseline v1 uses legacy hunk IDs. Rebuild it from reviewed 0.2 reports; "
+                "legacy IDs are not used to suppress distinct findings."
+            )
         before = len(findings)
         findings = [f for f in findings if not baseline.is_suppressed(f.finding_id)]
         suppressed = before - len(findings)
@@ -340,6 +377,7 @@ async def run_scan(
             started_at=started_at,
             completed_at=datetime.now(UTC),
             prompt_version=settings.prompt_version,
+            mode=settings.scan_mode,
         )
         return EXIT_OK, result
 
@@ -364,7 +402,9 @@ async def run_scan(
             f"quota_mode={settings.llm.quota_exhausted_mode}"
         )
 
-    scan_incomplete = False
+    scan_incomplete = any(c.truncated for c in enriched)
+    coverage_issues = ["Diff input was truncated"] if scan_incomplete else []
+    pinned_before, pinned_after = release.from_sha, release.to_sha
 
     try:
         # --- Triage ---
@@ -381,10 +421,16 @@ async def run_scan(
             cache_store,
             git_source,
             repo,
-            to_ref,
+            pinned_after,
             on_phase=on_phase,
             on_info=on_info,
         )
+
+        triage_stats.skipped_files = len(release.excluded_paths)
+        triage_stats.prefilter_dropped = release.prefilter_dropped
+
+        if repo_profile is not None:
+            triage_metrics.token_usage_complete = False
 
         if not relevant:
             on_info("[green]No security-relevant changes detected.[/green]")
@@ -393,6 +439,10 @@ async def run_scan(
                 release=release,
                 triage_stats=triage_stats,
                 llm_metrics=triage_metrics,
+                mode=settings.scan_mode,
+                complete=not scan_incomplete and scheduler.quota_error is None,
+                coverage_issues=coverage_issues
+                + (["LLM quota exhausted"] if scheduler.quota_error else []),
                 started_at=started_at,
                 completed_at=datetime.now(UTC),
                 prompt_version=settings.prompt_version,
@@ -406,13 +456,13 @@ async def run_scan(
                     result.model_dump_json(),
                 )
                 if repo_profile is not None:
-                    repo_profile.last_ref = to_ref
+                    repo_profile.last_ref = pinned_after
                     await cache_store.set_repo_profile(
                         repo,
                         repo_profile.model_dump_json(),
-                        to_ref,
+                        pinned_after,
                     )
-            return EXIT_OK, result
+            return (EXIT_OK if result.complete else EXIT_INCOMPLETE), result
 
         # --- Deep analysis ---
         findings, analysis_metrics, incomplete = await _run_analysis_phase(
@@ -422,8 +472,8 @@ async def run_scan(
             repo,
             repo_profile_text,
             git_source,
-            from_ref,
-            to_ref,
+            pinned_before,
+            pinned_after,
             on_phase=on_phase,
             on_info=on_info,
         )
@@ -431,6 +481,49 @@ async def run_scan(
             scan_incomplete = True
 
         merged_metrics = triage_metrics.merge(analysis_metrics)
+        if repo_profile is not None:
+            # Profile generation/update calls are not included in stage token counters.
+            merged_metrics.token_usage_complete = False
+
+        reviewed: list[Finding] = []
+        if findings and settings.verify_findings:
+            on_phase(f"Verification ({len(findings)} candidates)...")
+            for candidate in findings:
+                item, verification_metrics = await verify_candidate(
+                    candidate,
+                    scheduler,
+                    git_source,
+                    settings,
+                    pinned_before,
+                    pinned_after,
+                    release.relationship,
+                )
+                reviewed.append(item)
+                merged_metrics = merged_metrics.merge(verification_metrics)
+        else:
+            reviewed = findings
+        candidates = [
+            f
+            for f in reviewed
+            if f.status
+            not in {
+                ReviewStatus.CONFIRMED_STATIC,
+                ReviewStatus.REPRODUCED,
+            }
+        ]
+        findings = [
+            f
+            for f in reviewed
+            if f.status
+            in {
+                ReviewStatus.CONFIRMED_STATIC,
+                ReviewStatus.REPRODUCED,
+            }
+        ]
+        coverage_issues.extend(merged_metrics.errors)
+        if scheduler.quota_error is not None:
+            coverage_issues.append("LLM quota exhausted")
+        scan_incomplete = scan_incomplete or bool(coverage_issues)
 
         # --- Post-processing ---
         findings, baseline_err = await _apply_post_processing(
@@ -447,6 +540,10 @@ async def run_scan(
             scan_id=scan_id,
             release=release,
             findings=findings,
+            candidates=candidates,
+            complete=not scan_incomplete,
+            mode=settings.scan_mode,
+            coverage_issues=coverage_issues,
             triage_stats=triage_stats,
             llm_metrics=merged_metrics,
             started_at=started_at,
@@ -469,8 +566,8 @@ async def run_scan(
                     scheduler,
                     settings,
                     repo=repo,
-                    from_ref=from_ref,
-                    to_ref=to_ref,
+                    from_ref=pinned_before,
+                    to_ref=pinned_after,
                     current_profile=repo_profile,
                     triage_stats=triage_stats,
                     relevant_pairs=relevant,
@@ -479,14 +576,12 @@ async def run_scan(
                 if updated_profile is not None:
                     repo_profile = updated_profile
 
-        if scheduler.quota_error is not None:
-            scan_incomplete = True
-
+        # Optional profile updates do not change the completed analysis verdict.
         # --- Exit code ---
         if scan_incomplete:
             on_info(
                 "[yellow]Scan completed with degraded coverage "
-                "due to LLM quota limitations.[/yellow]"
+                "(see coverage_issues in the report).[/yellow]"
             )
             return EXIT_INCOMPLETE, result
 

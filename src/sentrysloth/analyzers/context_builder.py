@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 import re
@@ -77,6 +78,23 @@ class ContextBuilder:
         if not chunk.hunks:
             return [sig for _, sig in signatures[:5]]
 
+        try:
+            tree = ast.parse(file_content)
+        except SyntaxError:
+            tree = None
+        if tree is not None:
+            enclosing = {
+                node.lineno
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                and any(
+                    node.lineno <= h.target_start + h.target_length
+                    and (node.end_lineno or node.lineno) >= h.target_start
+                    for h in chunk.hunks
+                )
+            }
+            return [sig for line, sig in signatures if line in enclosing][:10]
+
         changed_lines: set[int] = set()
         for hunk in chunk.hunks:
             for i in range(hunk.target_start, hunk.target_start + hunk.target_length):
@@ -117,6 +135,17 @@ class ContextBuilder:
 
 def extract_function_signatures(content: str) -> list[tuple[int, str]]:
     """Extract (line_number, signature) pairs from source code."""
+    try:
+        tree = ast.parse(content)
+    except SyntaxError:
+        tree = None
+    if tree is not None:
+        lines = content.splitlines()
+        return sorted(
+            (node.lineno, lines[node.lineno - 1].strip())
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+        )
     results: list[tuple[int, str]] = []
     for pattern in FUNC_PATTERNS:
         for match in pattern.finditer(content):

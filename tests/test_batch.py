@@ -168,7 +168,7 @@ class TestBuildTagPairs:
 
         pairs = build_tag_pairs(tags, since=cutoff, tag_dates=dates)
         # v3 (day -20), v4 (day -10), v5 (now) pass the filter
-        assert pairs == [TagPair("v3", "v4"), TagPair("v4", "v5")]
+        assert pairs == [TagPair("v2", "v3"), TagPair("v3", "v4"), TagPair("v4", "v5")]
 
     def test_since_no_dates_raises(self):
         with pytest.raises(BatchError, match="tag_dates required"):

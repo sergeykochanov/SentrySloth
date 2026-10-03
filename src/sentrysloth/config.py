@@ -9,7 +9,7 @@ from typing import Literal
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from sentrysloth.models import Confidence, Severity
+from sentrysloth.models import Confidence, ScanMode, Severity
 
 
 class QuotaExhaustedMode(StrEnum):
@@ -85,18 +85,21 @@ class Settings(BaseSettings):
     max_file_size_kb: int = Field(default=500, ge=1)
     chunk_token_budget: int = Field(default=4000, ge=1)
     prefilter_min_security_score: float = Field(
-        default=0.1,
+        default=0.0,
         ge=0.0,
         le=1.0,
         description="Chunks below this security score are dropped before LLM triage",
     )
 
     # Analysis
+    scan_mode: ScanMode = ScanMode.BOTH
+    verify_findings: bool = True
+    verification_max_turns: int = Field(default=8, ge=1, le=30)
     min_confidence: Confidence = Confidence.LOW
     fail_on_severity: Severity | None = None
 
     verbose: bool = False
-    prompt_version: str = "v1"
+    prompt_version: str = "v3"
 
 
 def get_settings(**overrides: object) -> Settings:

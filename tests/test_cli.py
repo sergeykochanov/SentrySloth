@@ -207,7 +207,7 @@ class TestPrintSummary:
             _print_summary(result, show_empty=True)
         assert mock_print.call_count == 1
         printed = str(mock_print.call_args)
-        assert "No findings" in printed
+        assert "No confirmed findings" in printed
         assert "https://github.com/org/repo" in printed
         assert "v1.0" in printed and "v1.1" in printed
 
@@ -253,7 +253,7 @@ class TestRunScanOutputSignature:
         # Will fail on GitSource.ensure_cloned() but should not fail on signature
         from sentrysloth.config import get_settings
 
-        settings = get_settings(clone_base_dir=tmp_path / "clones")
+        settings = get_settings(clone_base_dir=tmp_path / "clones", cache={"enabled": False})
         scan_output = ScanOutput(
             console,
             "test v1→v2",
