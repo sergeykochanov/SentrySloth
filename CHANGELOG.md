@@ -6,6 +6,16 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-03
+
+### Fixed
+- OpenAI-compatible providers stream responses by default, avoiding the observed disconnects while waiting for long Grok responses.
+- Streaming preserves fragmented text, parallel tool calls, and final usage with reasoning tokens.
+- Unfinished streams and truncated tool-call responses fail explicitly instead of being accepted as complete.
+
+### Added
+- `SENTRYSLOTH_LLM_STREAM_RESPONSES=false` compatibility option for endpoints without streaming support.
+
 ## [0.2.0] - 2026-10-03
 
 ### Added

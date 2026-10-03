@@ -27,6 +27,7 @@ def _make_provider(max_retries: int = 5) -> OpenAICompatProvider:
     """Create an OpenAICompatProvider with mocked client."""
     config = LLMConfig(
         analysis_model="test-model",
+        stream_responses=False,
         analysis_temperature=0.0,
         max_retries=max_retries,
         retry_base_delay=0.0,
@@ -238,6 +239,7 @@ async def test_staggered_wakeup_after_429():
     """After cooldown, concurrent requests should be staggered (not burst)."""
     config = LLMConfig(
         analysis_model="test-model",
+        stream_responses=False,
         analysis_temperature=0.0,
         max_retries=5,
         retry_base_delay=0.01,
@@ -466,7 +468,7 @@ async def test_no_tool_calls_returns_content():
 @pytest.mark.asyncio
 async def test_tool_usage_includes_separate_reasoning_tokens():
     provider = OpenAICompatProvider(
-        api_key="test", config=LLMConfig(), base_url="https://api.x.ai/v1"
+        api_key="test", config=LLMConfig(stream_responses=False), base_url="https://api.x.ai/v1"
     )
     response = MagicMock()
     response.choices = [MagicMock()]
@@ -487,7 +489,7 @@ async def test_tool_usage_includes_separate_reasoning_tokens():
 @pytest.mark.asyncio
 async def test_current_models_receive_stage_specific_reasoning():
     provider = _make_provider()
-    provider.config = LLMConfig()
+    provider.config = LLMConfig(stream_responses=False)
     provider._client.chat.completions.create = AsyncMock(return_value=_make_success_response())
     await provider.generate_structured("review", SimpleModel, model=provider.config.triage_model)
     assert provider._client.chat.completions.create.call_args.kwargs["model"] == "grok-4.3"

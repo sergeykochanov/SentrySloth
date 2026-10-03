@@ -95,6 +95,12 @@ Old `grok-4-1-fast-*` names are compatibility aliases redirected by xAI to Grok 
 see the [retirement notice](https://docs.x.ai/developers/migration/may-15-retirement).
 Use current [provider pricing](https://docs.x.ai/developers/pricing) when budgeting.
 
+OpenAI-compatible providers stream responses by default to avoid waiting for a complete
+long-running response before receiving data. Text and tool calls are assembled before
+analysis continues; final usage includes reasoning tokens. An unfinished or truncated
+stream is an error. Set `SENTRYSLOTH_LLM_STREAM_RESPONSES=false` for an endpoint that
+does not support streaming or `stream_options.include_usage`.
+
 ## Usage
 
 ### Scan a repository

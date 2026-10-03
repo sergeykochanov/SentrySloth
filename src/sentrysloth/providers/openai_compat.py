@@ -10,6 +10,7 @@ from typing import TypeVar
 
 import httpx
 import openai
+from openai.types.chat import ChatCompletion, ChatCompletionChunk
 from pydantic import ValidationError
 
 from sentrysloth.analyzers.diff_extractor import estimate_tokens
@@ -26,6 +27,71 @@ from sentrysloth.providers.base import (
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+async def _collect_streamed_completion(
+    stream: openai.AsyncStream[ChatCompletionChunk],
+) -> ChatCompletion:
+    """Assemble a complete response, preserving tool fragments and usage extras."""
+    content: list[str] = []
+    refusals: list[str] = []
+    tools: dict[int, dict] = {}
+    usage: dict | None = None
+    identity: dict = {}
+    finish: str | None = None
+    async with stream:
+        async for chunk in stream:
+            identity = {"id": chunk.id, "created": chunk.created, "model": chunk.model}
+            if chunk.usage is not None:
+                usage = chunk.usage.model_dump()
+            for choice in chunk.choices:
+                if choice.index != 0:
+                    continue
+                if choice.finish_reason is not None:
+                    finish = choice.finish_reason
+                if choice.delta.content:
+                    content.append(choice.delta.content)
+                if choice.delta.refusal:
+                    refusals.append(choice.delta.refusal)
+                for delta in choice.delta.tool_calls or []:
+                    tool = tools.setdefault(
+                        delta.index,
+                        {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                    )
+                    if delta.id:
+                        tool["id"] = delta.id
+                    if delta.function is not None:
+                        if delta.function.name:
+                            tool["function"]["name"] += delta.function.name
+                        if delta.function.arguments:
+                            tool["function"]["arguments"] += delta.function.arguments
+    if finish is None:
+        raise LLMProviderError(
+            "Streaming response ended without a final choice; analysis incomplete"
+        )
+    if usage is None:
+        raise LLMProviderError(
+            "Streaming response has no usage; disable stream_responses for incompatible endpoints"
+        )
+    return ChatCompletion.model_validate(
+        {
+            **identity,
+            "object": "chat.completion",
+            "usage": usage,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": finish,
+                    "message": {
+                        "role": "assistant",
+                        "content": "".join(content) or None,
+                        "refusal": "".join(refusals) or None,
+                        "tool_calls": [tools[i] for i in sorted(tools)] or None,
+                    },
+                }
+            ],
+        }
+    )
 
 
 class OpenAICompatProvider(LLMProvider):
@@ -108,6 +174,19 @@ class OpenAICompatProvider(LLMProvider):
         )
         return {"reasoning_effort": effort} if effort is not None else {}
 
+    async def _create_completion(self, **kwargs: object) -> ChatCompletion:
+        if not self.config.stream_responses:
+            return await self._client.chat.completions.create(**kwargs)
+        stream = await self._client.chat.completions.create(
+            **kwargs, stream=True, stream_options={"include_usage": True}
+        )
+        try:
+            return await _collect_streamed_completion(stream)
+        except httpx.TimeoutException as exc:
+            raise openai.APITimeoutError(request=stream.response.request) from exc
+        except httpx.TransportError as exc:
+            raise openai.APIConnectionError(request=stream.response.request) from exc
+
     async def generate_structured(
         self,
         prompt: str,
@@ -123,7 +202,7 @@ class OpenAICompatProvider(LLMProvider):
         schema = response_model.model_json_schema()
 
         response, elapsed_ms = await self._call_with_retries(
-            lambda: self._client.chat.completions.create(
+            lambda: self._create_completion(
                 model=model_name,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temp,
@@ -192,7 +271,7 @@ class OpenAICompatProvider(LLMProvider):
         temp = temperature if temperature is not None else self.config.analysis_temperature
 
         response, _ = await self._call_with_retries(
-            lambda: self._client.chat.completions.create(
+            lambda: self._create_completion(
                 model=model_name,
                 messages=messages,
                 tools=tools,
@@ -205,6 +284,8 @@ class OpenAICompatProvider(LLMProvider):
         )
 
         choice = response.choices[0]
+        if choice.finish_reason == "length":
+            raise LLMProviderError(f"Response truncated: model {model_name} hit max_tokens limit")
         tool_calls: list[ToolCall] = []
         if choice.message.tool_calls:
             for tc in choice.message.tool_calls:
