@@ -24,7 +24,14 @@ class VerificationDecision(BaseModel):
     trust_boundary: str = ""
     impact: str = ""
     before_after: str = ""
-    mitigations_checked: list[str] = Field(default_factory=list)
+    mitigations_checked: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Actual counterchecks performed, including negative results with paths. "
+            "If no compensating guard exists, record where you checked and that it is "
+            "absent. An empty list means you did not check, not that no guard exists."
+        ),
+    )
     missing_evidence: list[str] = Field(default_factory=list)
     evidence: list[EvidenceItem] = Field(default_factory=list)
 
@@ -43,7 +50,10 @@ encoded inputs, streaming modes and concurrency. Strict validation itself is not
 Return JSON matching the supplied schema. Cite exact source ranges WITHOUT diff prefixes and
 set revision=before/after. Confirm only when attacker control, reachable entry point, boundary,
 impact, before/after behavior and existing mitigations are supported by inspected source.
-Include source evidence for the reachable caller and the affected operation. Missing dependency
+Include source evidence for the reachable caller and the affected operation.
+In mitigations_checked record the checks you performed even when no mitigation was found.
+For example: inspected caller in routes.py; no upstream authorization guard exists.
+An empty list means no investigation was done and prevents confirmation. Missing dependency
 source or uncertain reachability means needs_review, not confirmed. Never claim reproduction:
 no code has been executed. Preserve useful hypotheses and list the concrete missing checks.
 Use rejected only when you have specific counterevidence and cite it.

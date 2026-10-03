@@ -97,6 +97,17 @@ class OpenAICompatProvider(LLMProvider):
             raise LLMProviderError(f"API error {exc.status_code}: {exc}") from exc
         raise
 
+    def _reasoning_options(self, model: str, *, analysis: bool = False) -> dict:
+        """Keep the triage pass cheap and explicitly select analysis reasoning depth."""
+        if not model.startswith(("grok-4.3", "grok-4.5", "grok-4.6", "grok-4.7")):
+            return {}
+        effort = (
+            self.config.analysis_reasoning_effort
+            if analysis or model != self.config.triage_model
+            else self.config.triage_reasoning_effort
+        )
+        return {"reasoning_effort": effort} if effort is not None else {}
+
     async def generate_structured(
         self,
         prompt: str,
@@ -117,6 +128,7 @@ class OpenAICompatProvider(LLMProvider):
                 messages=[{"role": "user", "content": prompt}],
                 temperature=temp,
                 max_tokens=max_output_tokens,
+                **self._reasoning_options(model_name),
                 response_format={
                     "type": "json_schema",
                     "json_schema": {
@@ -154,6 +166,10 @@ class OpenAICompatProvider(LLMProvider):
         if response.usage:
             input_tokens = response.usage.prompt_tokens or 0
             output_tokens = response.usage.completion_tokens or 0
+            # xAI reports reasoning separately from visible completion tokens.
+            total_tokens = response.usage.total_tokens
+            if isinstance(total_tokens, int):
+                output_tokens = max(output_tokens, total_tokens - input_tokens)
 
         return LLMResponse(
             data=data,
@@ -180,6 +196,7 @@ class OpenAICompatProvider(LLMProvider):
                 model=model_name,
                 messages=messages,
                 tools=tools,
+                **self._reasoning_options(model_name, analysis=True),
                 temperature=temp,
                 max_tokens=max_output_tokens,
             ),
@@ -213,6 +230,10 @@ class OpenAICompatProvider(LLMProvider):
         if response.usage:
             input_tokens = response.usage.prompt_tokens or 0
             output_tokens = response.usage.completion_tokens or 0
+            # xAI reports reasoning separately from visible completion tokens.
+            total_tokens = response.usage.total_tokens
+            if isinstance(total_tokens, int):
+                output_tokens = max(output_tokens, total_tokens - input_tokens)
 
         return ToolCallResponse(
             content=choice.message.content or "",

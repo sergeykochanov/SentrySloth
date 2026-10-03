@@ -53,8 +53,8 @@ All settings are controlled via environment variables with the `SENTRYSLOTH_` pr
 | `SENTRYSLOTH_LLM_PROVIDER` | LLM provider (`grok` or `gemini`) | `grok` |
 | `SENTRYSLOTH_GROK_API_KEY` | **Required when provider=`grok`.** xAI API key | — |
 | `SENTRYSLOTH_GEMINI_API_KEY` | **Required when provider=`gemini`.** Gemini API key | — |
-| `SENTRYSLOTH_LLM_TRIAGE_MODEL` | Model for triage stage | `grok-4-1-fast-non-reasoning` |
-| `SENTRYSLOTH_LLM_ANALYSIS_MODEL` | Model for deep analysis | `grok-4-1-fast-reasoning` |
+| `SENTRYSLOTH_LLM_TRIAGE_MODEL` | Model for triage stage | `grok-4.3` |
+| `SENTRYSLOTH_LLM_ANALYSIS_MODEL` | Model for deep analysis | `grok-4.7` |
 | `SENTRYSLOTH_LLM_SCHEDULER_WORKERS` | Scheduler worker count | `4` |
 | `SENTRYSLOTH_LLM_QUEUE_MAX_SIZE` | Max pending LLM requests in local queue | `1000` |
 | `SENTRYSLOTH_LLM_MAX_REQUESTS_PER_MINUTE` | Local requests-per-minute limiter | `120` |
@@ -79,6 +79,21 @@ All settings are controlled via environment variables with the `SENTRYSLOTH_` pr
 | `SENTRYSLOTH_CLONE_BASE_DIR` | Local directory for git clones | `~/.cache/sentrysloth/repos` |
 
 See [`.env.example`](.env.example) for a template.
+
+The default xAI setup uses **Grok 4.3 / none** for triage and **Grok 4.7 / high**
+for deep analysis and independent verification. The flagship is reserved for the stages
+that need source investigation and counterevidence; triage keeps the initial pass cheaper.
+These defaults are based on the [Grok 4.7 capabilities](https://docs.x.ai/developers/models/grok-4.7)
+and [Grok 4.3 capabilities](https://docs.x.ai/developers/models/grok-4.3), not a claimed benchmark gain.
+
+Set `SENTRYSLOTH_LLM_TRIAGE_REASONING_EFFORT` or
+`SENTRYSLOTH_LLM_ANALYSIS_REASONING_EFFORT` to override reasoning depth.
+Supported 4.7 levels are `low`, `medium`, `high`, `xhigh`; reasoning cannot be disabled.
+These options are sent only for supported Grok model families, not to Gemini.
+
+Old `grok-4-1-fast-*` names are compatibility aliases redirected by xAI to Grok 4.3;
+see the [retirement notice](https://docs.x.ai/developers/migration/may-15-retirement).
+Use current [provider pricing](https://docs.x.ai/developers/pricing) when budgeting.
 
 ## Usage
 

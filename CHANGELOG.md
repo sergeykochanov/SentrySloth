@@ -23,10 +23,12 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 - Analysis failures no longer appear as successful empty scans. JSON and SARIF expose incomplete coverage.
 - `--since` preserves the predecessor needed to review the first qualifying release.
 - Independent findings in the same hunk have distinct evidence-based IDs.
+- xAI token accounting includes reasoning tokens reported separately from visible output.
 - Repository profiles are reused only at the same revision and discard accumulated risk hypotheses.
 - Source containing Markdown fences or role-like strings is preserved for analysis.
 
 ### Changed
+- Default xAI models: Grok 4.3 without reasoning for triage, Grok 4.7 with high reasoning for analysis and verification. Reasoning effort is configurable.
 - Heuristic prefilter defaults to zero to avoid silently dropping low-scoring changes.
 - Low-severity candidates are retained; confirmation requires evidence, not a severity threshold.
 - Final findings and the candidate review queue are separate. `--no-verify` produces candidates only.

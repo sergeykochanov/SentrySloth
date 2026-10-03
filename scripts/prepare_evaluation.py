@@ -22,7 +22,7 @@ def prepare(cases_path: Path, output: Path) -> Path:
         actor = Actor("Evaluation fixture", "fixture@example.invalid")
         for revision in ("before", "after"):
             files = {
-                "README.md": "# Fixture contract\n\n" + definition["reason"] + "\n\n"
+                "README.md": "# Fixture contract\n\n"
                 "Request fields are untrusted. require_admin enforces authorization. "
                 "delete_account is a protected side effect. The form parser promises "
                 "a memory limit even for unbounded streams.\n",

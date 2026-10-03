@@ -24,8 +24,10 @@ class LLMConfig(BaseSettings):
     provider: Literal["gemini", "grok"] = "grok"
     model_prefix: str = ""
 
-    triage_model: str = "grok-4-1-fast-non-reasoning"
-    analysis_model: str = "grok-4-1-fast-reasoning"
+    triage_model: str = "grok-4.3"
+    analysis_model: str = "grok-4.7"
+    triage_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None = "none"
+    analysis_reasoning_effort: Literal["none", "low", "medium", "high", "xhigh"] | None = "high"
 
     triage_temperature: float = 0.1
     analysis_temperature: float = 0.2

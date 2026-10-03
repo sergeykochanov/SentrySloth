@@ -11,6 +11,7 @@ Cases cover reordered and commented-out guards, Python indentation, moved checks
 HTTP rejection, an output containment guard, an incomplete streaming limit, and an
 unresolved dependency change. Development and holdout sets are fixed in `cases.json`.
 The fixtures and labels are public; this is a workflow split, not a blind benchmark.
+Expected verdicts and label reasons are kept outside the repositories passed to the scanner.
 
 ## Prepare and scan
 

@@ -461,3 +461,40 @@ async def test_no_tool_calls_returns_content():
     assert result.content == "Analysis complete."
     assert result.input_tokens == 50
     assert result.output_tokens == 10
+
+
+@pytest.mark.asyncio
+async def test_tool_usage_includes_separate_reasoning_tokens():
+    provider = OpenAICompatProvider(
+        api_key="test", config=LLMConfig(), base_url="https://api.x.ai/v1"
+    )
+    response = MagicMock()
+    response.choices = [MagicMock()]
+    response.choices[0].message.content = "{}"
+    response.choices[0].message.tool_calls = None
+    response.usage.prompt_tokens = 100
+    response.usage.completion_tokens = 20
+    response.usage.total_tokens = 170
+    provider._client.chat.completions.create = AsyncMock(return_value=response)
+    try:
+        result = await provider.generate_with_tools(messages=[], tools=[])
+        assert result.input_tokens == 100
+        assert result.output_tokens == 70
+    finally:
+        await provider.close()
+
+
+@pytest.mark.asyncio
+async def test_current_models_receive_stage_specific_reasoning():
+    provider = _make_provider()
+    provider.config = LLMConfig()
+    provider._client.chat.completions.create = AsyncMock(return_value=_make_success_response())
+    await provider.generate_structured("review", SimpleModel, model=provider.config.triage_model)
+    assert provider._client.chat.completions.create.call_args.kwargs["model"] == "grok-4.3"
+    assert provider._client.chat.completions.create.call_args.kwargs["reasoning_effort"] == "none"
+    response = _make_success_response()
+    response.choices[0].message.tool_calls = None
+    provider._client.chat.completions.create.return_value = response
+    await provider.generate_with_tools(messages=[], tools=[])
+    assert provider._client.chat.completions.create.call_args.kwargs["model"] == "grok-4.7"
+    assert provider._client.chat.completions.create.call_args.kwargs["reasoning_effort"] == "high"
