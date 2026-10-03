@@ -44,6 +44,11 @@ def generate_markdown_report(result: ScanResult) -> str:
     lines.append(f"- Source commits: `{result.release.from_sha}` -> `{result.release.to_sha}`")
     for issue in result.coverage_issues:
         lines.append(f"- Coverage issue: {issue}")
+    if result.llm_metrics and result.llm_metrics.analysis_failures:
+        lines.extend(["", "## Unparsed analysis requiring review", ""])
+        for failure in result.llm_metrics.analysis_failures:
+            lines.append(f"- `{failure.file_path}`: {failure.reason}")
+        lines.append("Original and repair responses are preserved in the JSON report.")
     if result.candidates:
         lines.extend(["", "## Candidate review queue", ""])
         for item in result.candidates:

@@ -671,6 +671,52 @@ class TestMultipleToolCallsPerTurn:
 
 class TestAgenticJsonRepair:
     @pytest.mark.asyncio
+    async def test_prose_list_fields_preserve_candidate_without_repair(self):
+        payload = json.loads(_finding_response())
+        payload["findings"][0]["mitigations_checked"] = "Authentication middleware checked"
+        payload["findings"][0]["missing_evidence"] = "Deployment configuration unknown"
+        provider = AsyncMock(spec=LLMProvider)
+        provider.generate_with_tools.return_value = ToolCallResponse(
+            content=json.dumps(payload), tool_calls=[]
+        )
+        findings, _, _, _ = await analyze_chunk_agentic(
+            chunk=_make_chunk(),
+            triage=_make_triage(),
+            provider=provider,
+            git_source=_make_mock_git_source(),
+            settings=get_settings(),
+            repo="test-repo",
+            from_ref="v1.0",
+            to_ref="v1.1",
+        )
+        assert findings[0].mitigations_checked == ["Authentication middleware checked"]
+        assert findings[0].missing_evidence == ["Deployment configuration unknown"]
+        provider.generate_with_tools.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_prose_before_json_does_not_discard_findings(self):
+        provider = AsyncMock(spec=LLMProvider)
+        provider.generate_with_tools.return_value = ToolCallResponse(
+            content="Review complete.\n" + _finding_response(),
+            tool_calls=[],
+            input_tokens=300,
+            output_tokens=80,
+        )
+        findings, in_tok, out_tok, _ = await analyze_chunk_agentic(
+            chunk=_make_chunk(),
+            triage=_make_triage(),
+            provider=provider,
+            git_source=_make_mock_git_source(),
+            settings=get_settings(),
+            repo="test-repo",
+            from_ref="v1.0",
+            to_ref="v1.1",
+        )
+        assert len(findings) == 1
+        assert (in_tok, out_tok) == (300, 80)
+        provider.generate_with_tools.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_repair_invalid_final_json_and_keep_findings(self):
         call_count = 0
 
@@ -735,7 +781,7 @@ class TestAgenticJsonRepair:
         provider = AsyncMock(spec=LLMProvider)
         provider.generate_with_tools = mock_generate
 
-        with pytest.raises(AgenticParseError, match="remained invalid"):
+        with pytest.raises(AgenticParseError, match="remained invalid") as caught:
             await analyze_chunk_agentic(
                 chunk=_make_chunk(),
                 triage=_make_triage(),
@@ -746,6 +792,56 @@ class TestAgenticJsonRepair:
                 from_ref="v1.0",
                 to_ref="v1.1",
             )
+        assert caught.value.failure.raw_response == '{"findings":[{"title":"broken"'
+        assert caught.value.failure.repair_response == "still not json"
+        assert caught.value.failure.from_ref == "v1.0"
+        assert caught.value.failure.to_ref == "v1.1"
+        assert (caught.value.input_tokens, caught.value.output_tokens) == (400, 110)
+
+    @pytest.mark.asyncio
+    async def test_empty_repair_cannot_erase_unparsed_answer(self):
+        original = "candidate details " + "x" * 13000 + " end of evidence"
+        provider = AsyncMock(spec=LLMProvider)
+        provider.generate_with_tools.side_effect = [
+            ToolCallResponse(content=original, tool_calls=[]),
+            ToolCallResponse(content='{"findings": [], "summary": "no issues"}', tool_calls=[]),
+        ]
+        with pytest.raises(AgenticParseError) as caught:
+            await analyze_chunk_agentic(
+                chunk=_make_chunk(),
+                triage=_make_triage(),
+                provider=provider,
+                git_source=_make_mock_git_source(),
+                settings=get_settings(),
+                repo="test-repo",
+                from_ref="v1.0",
+                to_ref="v1.1",
+            )
+        assert caught.value.failure.raw_response == original
+        repair_prompt = provider.generate_with_tools.call_args.kwargs["messages"][-1]["content"]
+        assert original in repair_prompt
+        assert '"$defs"' in repair_prompt
+
+    @pytest.mark.asyncio
+    async def test_failed_repair_request_preserves_original_answer(self):
+        provider = AsyncMock(spec=LLMProvider)
+        provider.generate_with_tools.side_effect = [
+            ToolCallResponse(content="unfinished candidate", tool_calls=[], input_tokens=50),
+            LLMProviderError("repair offline"),
+        ]
+        with pytest.raises(AgenticParseError) as caught:
+            await analyze_chunk_agentic(
+                chunk=_make_chunk(),
+                triage=_make_triage(),
+                provider=provider,
+                git_source=_make_mock_git_source(),
+                settings=get_settings(),
+                repo="test-repo",
+                from_ref="v1.0",
+                to_ref="v1.1",
+            )
+        assert caught.value.failure.raw_response == "unfinished candidate"
+        assert caught.value.input_tokens == 50
 
 
 class TestLLMProviderErrorDuringToolUse:

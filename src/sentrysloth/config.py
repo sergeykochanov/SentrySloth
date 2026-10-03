@@ -102,7 +102,7 @@ class Settings(BaseSettings):
     fail_on_severity: Severity | None = None
 
     verbose: bool = False
-    prompt_version: str = "v3"
+    prompt_version: str = "v4"
 
 
 def get_settings(**overrides: object) -> Settings:

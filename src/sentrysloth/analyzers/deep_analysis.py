@@ -13,7 +13,7 @@ from sentrysloth.analyzers.analysis_shared import (
 )
 from sentrysloth.analyzers.worker_pool import run_bounded_pool
 from sentrysloth.config import QuotaExhaustedMode, Settings
-from sentrysloth.models import DiffChunk, Finding, LLMMetrics, TriageResult
+from sentrysloth.models import AnalysisFailure, DiffChunk, Finding, LLMMetrics, TriageResult
 from sentrysloth.providers.base import LLMProvider, LLMProviderError, LLMQuotaExceededError
 from sentrysloth.sources.git import GitSource
 
@@ -106,11 +106,17 @@ async def run_deep_analysis(
         max_in_flight = min(max_in_flight, 2)
 
     fallback_files: set[str] = set()
+    failed_indices: set[int] = set()
+    errors: list[str] = []
+    analysis_failures: list[AnalysisFailure] = []
+    failed_input_tokens = 0
+    failed_output_tokens = 0
 
     async def _worker(
         idx: int,
         pair: tuple[DiffChunk, TriageResult],
     ) -> tuple[int, list[Finding], int, int, float]:
+        nonlocal failed_input_tokens, failed_output_tokens
         chunk, triage = pair
         if use_agentic and git_source is not None:
             try:
@@ -128,8 +134,24 @@ async def run_deep_analysis(
                 return idx, findings, in_tok, out_tok, elapsed
             except NotImplementedError:
                 logger.info("Provider does not support tool use, falling back to single-turn")
+            except LLMQuotaExceededError:
+                raise
             except AgenticParseError as exc:
                 fallback_files.add(chunk.file_path)
+                failed_indices.add(idx)
+                errors.append(f"{chunk.file_path}: agentic analysis incomplete: {exc}")
+                analysis_failures.append(
+                    exc.failure
+                    or AnalysisFailure(
+                        file_path=chunk.file_path,
+                        raw_diff=chunk.raw_diff,
+                        from_ref=from_ref,
+                        to_ref=to_ref,
+                        reason=str(exc),
+                    )
+                )
+                failed_input_tokens += exc.input_tokens
+                failed_output_tokens += exc.output_tokens
                 logger.warning(
                     "agentic_fallback_singleturn reason=parse_error_after_repair file=%s: %s",
                     chunk.file_path,
@@ -137,6 +159,8 @@ async def run_deep_analysis(
                 )
             except LLMProviderError as exc:
                 fallback_files.add(chunk.file_path)
+                failed_indices.add(idx)
+                errors.append(f"{chunk.file_path}: agentic analysis incomplete: {exc}")
                 logger.warning(
                     "Agentic analysis failed for %s: %s, falling back", chunk.file_path, exc
                 )
@@ -151,16 +175,16 @@ async def run_deep_analysis(
         )
         return idx, findings, in_tok, out_tok, elapsed
 
-    errors: list[str] = []
-
     async def safe_worker(idx, pair):
         try:
             return await _worker(idx, pair)
         except LLMQuotaExceededError as exc:
             if settings.llm.quota_exhausted_mode == QuotaExhaustedMode.FAIL_FAST:
                 raise
+            failed_indices.add(idx)
             errors.append(f"{pair[0].file_path}: {exc}")
         except LLMProviderError as exc:
+            failed_indices.add(idx)
             errors.append(f"{pair[0].file_path}: {exc}")
         return idx, [], 0, 0, 0.0
 
@@ -169,8 +193,8 @@ async def run_deep_analysis(
     elapsed_ms = (time.monotonic() - start) * 1000
 
     all_findings: list[Finding] = []
-    analysis_input_tokens = 0
-    analysis_output_tokens = 0
+    analysis_input_tokens = failed_input_tokens
+    analysis_output_tokens = failed_output_tokens
     for _idx, chunk_findings, in_tokens, out_tokens, _latency in rows:
         all_findings.extend(chunk_findings)
         analysis_input_tokens += in_tokens
@@ -188,8 +212,9 @@ async def run_deep_analysis(
         analysis_input_tokens=analysis_input_tokens,
         analysis_output_tokens=analysis_output_tokens,
         analysis_latency_ms=elapsed_ms,
-        analysis_completed=len(rows) - len(errors),
+        analysis_completed=len(rows) - len(failed_indices),
         errors=errors,
+        analysis_failures=analysis_failures,
         token_usage_complete=not errors and not fallback_files,
     )
 

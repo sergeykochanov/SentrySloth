@@ -256,6 +256,18 @@ class TriageStats(BaseModel):
     prefilter_dropped: int = 0
 
 
+class AnalysisFailure(BaseModel):
+    """Unparsed model output for manual review, never a confirmed finding."""
+
+    file_path: str
+    raw_diff: str = ""
+    from_ref: str = ""
+    to_ref: str = ""
+    reason: str
+    raw_response: str = ""
+    repair_response: str = ""
+
+
 class LLMMetrics(BaseModel):
     triage_input_tokens: int = 0
     triage_output_tokens: int = 0
@@ -269,6 +281,7 @@ class LLMMetrics(BaseModel):
     verification_output_tokens: int = 0
     verification_latency_ms: float = 0.0
     errors: list[str] = Field(default_factory=list)
+    analysis_failures: list[AnalysisFailure] = Field(default_factory=list)
     token_usage_complete: bool = True
 
     def merge(self, other: LLMMetrics) -> LLMMetrics:

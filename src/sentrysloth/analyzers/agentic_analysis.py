@@ -17,17 +17,28 @@ from sentrysloth.analyzers.diff_extractor import sanitize_diff_content
 from sentrysloth.analyzers.repository_tools import TOOLS
 from sentrysloth.analyzers.repository_tools import execute_tool_call as _execute_tool_call
 from sentrysloth.config import Settings
-from sentrysloth.models import DiffChunk, Finding, TriageResult
+from sentrysloth.models import AnalysisFailure, DiffChunk, Finding, TriageResult
 from sentrysloth.providers.base import LLMProvider, LLMProviderError, ToolCallResponse
 from sentrysloth.sources.git import GitSource
 
 logger = logging.getLogger(__name__)
 
-MAX_REPAIR_SOURCE_CHARS = 12000
-
 
 class AgenticParseError(Exception):
     """Raised when final agentic response cannot be recovered to valid JSON."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure: AnalysisFailure | None = None,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+    ):
+        super().__init__(message)
+        self.failure = failure
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 def _build_initial_messages(
@@ -51,6 +62,7 @@ def _build_initial_messages(
         "start_line, end_line, snippet (exact source, without diff prefixes), "
         "revision (before/after), reasoning), "
         "cwe_ids, recommendation.\n\n"
+        f"Full JSON schema:\n{json.dumps(AnalysisResponse.model_json_schema())}\n\n"
         'If there are no real security concerns, return {"findings": [], "summary": "..."}.'
     )
 
@@ -89,10 +101,26 @@ def _try_parse_final_response(
                 break
 
     try:
-        parsed = json.loads(text)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            # Accept a single JSON object preceded by explanatory text. Do not
+            # guess escapes or choose between multiple competing answers.
+            start = text.find("{")
+            if start < 0:
+                return [], False
+            parsed, end = json.JSONDecoder().raw_decode(text, start)
+            if "{" in text[end:]:
+                return [], False
         analysis = AnalysisResponse.model_validate(parsed)
-    except (json.JSONDecodeError, ValidationError) as exc:
+    except json.JSONDecodeError as exc:
         logger.warning("Failed to parse agentic analysis response: %s", exc)
+        return [], False
+    except ValidationError as exc:
+        logger.warning(
+            "Agentic response failed schema validation: %s",
+            [(error["loc"], error["type"]) for error in exc.errors()],
+        )
         return [], False
 
     return filter_and_convert_findings(analysis.findings, repo, chunk), True
@@ -118,10 +146,12 @@ async def _repair_final_response(
     repair_prompt = (
         "Your previous final answer was invalid JSON and could not be parsed.\n"
         "Return ONLY a valid JSON object matching this schema:\n"
-        '{"findings": [...], "summary": "..."}\n'
+        f"{json.dumps(AnalysisResponse.model_json_schema())}\n"
+        "Repair syntax and field types only. Preserve every candidate and its evidence; "
+        "do not reassess the code or replace the answer with an empty findings list.\n"
         "Do not include markdown fences or extra text.\n\n"
         "Previous invalid response:\n"
-        f"{sanitize_diff_content(invalid_response.content)[:MAX_REPAIR_SOURCE_CHARS]}"
+        f"{sanitize_diff_content(invalid_response.content)}"
     )
     repair_messages = list(messages)
     repair_messages.append({"role": "user", "content": repair_prompt})
@@ -168,6 +198,26 @@ async def analyze_chunk_agentic(
         *,
         phase: str,
     ) -> tuple[list[Finding], int, int]:
+        def parse_error(
+            reason: str, repaired_response: ToolCallResponse | None = None
+        ) -> AgenticParseError:
+            return AgenticParseError(
+                reason,
+                failure=AnalysisFailure(
+                    file_path=chunk.file_path,
+                    raw_diff=chunk.raw_diff,
+                    from_ref=from_ref,
+                    to_ref=to_ref,
+                    reason=reason,
+                    raw_response=final_response.content,
+                    repair_response=repaired_response.content if repaired_response else "",
+                ),
+                input_tokens=total_input_tokens
+                + (repaired_response.input_tokens if repaired_response else 0),
+                output_tokens=total_output_tokens
+                + (repaired_response.output_tokens if repaired_response else 0),
+            )
+
         findings, parse_ok = _try_parse_final_response(final_response, repo, chunk)
         if parse_ok:
             return findings, 0, 0
@@ -182,12 +232,10 @@ async def analyze_chunk_agentic(
                 final_response,
             )
         except (LLMProviderError, NotImplementedError) as exc:
-            raise AgenticParseError(
-                f"JSON repair request failed for {chunk.file_path}: {exc}"
-            ) from exc
+            raise parse_error(f"JSON repair request failed for {chunk.file_path}: {exc}") from exc
 
         repaired_findings, repaired_ok = _try_parse_final_response(repaired_response, repo, chunk)
-        if repaired_ok:
+        if repaired_ok and repaired_findings:
             logger.info("agentic_repair_success chunk=%s phase=%s", chunk.file_path, phase)
             return (
                 repaired_findings,
@@ -195,8 +243,10 @@ async def analyze_chunk_agentic(
                 repaired_response.output_tokens,
             )
 
-        raise AgenticParseError(
-            f"Final response remained invalid after JSON repair for {chunk.file_path}"
+        raise parse_error(
+            f"Final response remained invalid or lost candidates after JSON repair "
+            f"for {chunk.file_path}",
+            repaired_response,
         )
 
     for turn in range(max_turns):

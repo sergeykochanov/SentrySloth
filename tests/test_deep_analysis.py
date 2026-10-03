@@ -133,3 +133,7 @@ async def test_run_deep_analysis_falls_back_after_agentic_parse_failure():
     assert findings == [fallback_finding]
     assert metrics.analysis_input_tokens == 11
     assert metrics.analysis_output_tokens == 22
+    assert metrics.analysis_completed == 0
+    assert metrics.errors
+    assert not metrics.token_usage_complete
+    assert metrics.analysis_failures[0].file_path == chunk.file_path

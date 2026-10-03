@@ -6,6 +6,18 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-10-03
+
+### Fixed
+- Failed agentic analysis remains incomplete even when the single-turn fallback succeeds with no findings. JSON, Markdown and SARIF expose this coverage gap.
+- Unparsed original and repair responses are preserved in `llm_metrics.analysis_failures`, with the diff and source revisions for manual review. They are never promoted to confirmed findings.
+- Known token usage from failed parsing and repair is retained, including when the fallback also fails.
+- JSON repair receives the full response and actual schema, and cannot erase an unparsed answer with an empty findings list.
+- Explanatory text before a single JSON answer and prose in list-valued review fields no longer trigger unnecessary repair calls.
+
+### Changed
+- Analysis prompt version is now `v4`, preventing reuse of cached results from the affected pipeline.
+
 ## [0.2.1] - 2026-10-03
 
 ### Fixed

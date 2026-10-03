@@ -23,7 +23,7 @@ from sentrysloth.models import (
 
 logger = logging.getLogger(__name__)
 
-ANALYSIS_PROMPT_VERSION = "v3"
+ANALYSIS_PROMPT_VERSION = "v4"
 MAX_REPO_PROFILE_CHARS = 3000
 MAX_FUNCTION_SIGNATURE_CHARS = 300
 MAX_SURROUNDING_CONTEXT_CHARS = 5000
@@ -119,6 +119,14 @@ class AnalysisFinding(BaseModel):
     before_after: str = ""
     mitigations_checked: list[str] = Field(default_factory=list)
     missing_evidence: list[str] = Field(default_factory=list)
+
+    @field_validator("mitigations_checked", "missing_evidence", mode="before")
+    @classmethod
+    def _wrap_text_as_list(cls, value):
+        """Preserve a model's single prose item without a paid repair call."""
+        if isinstance(value, str):
+            return [value] if value.strip() else []
+        return value
 
     @field_validator("evidence", mode="before")
     @classmethod

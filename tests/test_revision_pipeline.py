@@ -9,12 +9,16 @@ from unittest.mock import AsyncMock
 import pytest
 from git import Repo
 
+from sentrysloth.analyzers.analysis_shared import AnalysisResponse
 from sentrysloth.analyzers.diff_extractor import _is_noise_only_change, extract_chunks
 from sentrysloth.analyzers.repository_tools import execute_tool_call, source_range
 from sentrysloth.batch import build_tag_pairs, resolve_tag_pairs
 from sentrysloth.config import get_settings
 from sentrysloth.models import LLMResponse, TriageResult
 from sentrysloth.providers.base import LLMProviderError, ToolCall, ToolCallResponse
+from sentrysloth.reporters.json_reporter import generate_json_report
+from sentrysloth.reporters.markdown_reporter import generate_markdown_report
+from sentrysloth.reporters.sarif_reporter import generate_sarif_report
 from sentrysloth.scanner import EXIT_INCOMPLETE, EXIT_OK, run_scan
 from sentrysloth.sources.git import GitSource
 from tests.test_verification import candidate, decision
@@ -169,6 +173,61 @@ async def test_scan_records_provider_outcome_with_pinned_refs(history, failed):
     assert report.release.from_sha == first and report.release.to_sha == second
     assert report.release.relationship == "ancestor"
     assert bool(report.coverage_issues) == failed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fallback_fails", [False, True])
+@pytest.mark.parametrize("agentic_failure", ["parse", "provider"])
+async def test_unparsed_candidate_survives_fallback_and_report_roundtrip(
+    history, fallback_fails, agentic_failure
+):
+    repo, _, _ = history
+    scheduler = AsyncMock()
+    scheduler.quota_error = None
+    original = '{"findings": [{"title": "Candidate needing review"'
+    repair = "invalid repair"
+    scheduler.generate_with_tools.side_effect = [
+        ToolCallResponse(content=original, tool_calls=[], input_tokens=30, output_tokens=10),
+        ToolCallResponse(content=repair, tool_calls=[], input_tokens=20, output_tokens=5),
+    ]
+    if agentic_failure == "provider":
+        scheduler.generate_with_tools.side_effect = LLMProviderError("agentic offline")
+    scheduler.generate_structured.side_effect = [
+        LLMResponse(data=TriageResult(chunk_file_path="app.py", is_security_relevant=True)),
+        LLMProviderError("fallback offline")
+        if fallback_fails
+        else LLMResponse(
+            data=AnalysisResponse(findings=[], summary="no findings"),
+            input_tokens=7,
+        ),
+    ]
+    code, report = await run_scan(
+        repo.working_tree_dir,
+        "v1.0.0",
+        "v1.0.1",
+        get_settings(cache={"enabled": False}),
+        None,
+        scheduler=scheduler,
+    )
+    assert code == EXIT_INCOMPLETE
+    assert not report.complete and report.coverage_issues
+    assert report.findings == [] and report.candidates == []
+    assert report.llm_metrics.analysis_completed == 0
+    failed_input = 50 if agentic_failure == "parse" else 0
+    assert report.llm_metrics.analysis_input_tokens == failed_input + (0 if fallback_fails else 7)
+    assert report.llm_metrics.analysis_output_tokens == (15 if agentic_failure == "parse" else 0)
+    serialized = json.loads(generate_json_report(report))
+    if agentic_failure == "parse":
+        failure = serialized["llm_metrics"]["analysis_failures"][0]
+        assert failure["raw_response"] == original
+        assert failure["repair_response"] == repair
+        assert failure["from_ref"] == report.release.from_sha
+        assert failure["to_ref"] == report.release.to_sha
+        assert "Unparsed analysis requiring review" in generate_markdown_report(report)
+    else:
+        assert serialized["llm_metrics"]["analysis_failures"] == []
+    sarif = json.loads(generate_sarif_report(report))
+    assert not sarif["runs"][0]["invocations"][0]["executionSuccessful"]
 
 
 @pytest.mark.asyncio
